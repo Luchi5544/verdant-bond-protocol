@@ -47,6 +47,18 @@ cd frontend && npm install && cd ..
 cd contracts && cargo build --release && cargo test && cd ..
 ```
 
+## Contributor Domain Map
+
+Hard issues are labeled with domain tags that route contributors to the right files, commands, and maintainers. Use this map to know where to focus your efforts.
+
+| Label | Domain | Target Files | Test Commands | Maintainers |
+|-------|--------|--------------|---------------|-------------|
+| `hard:contract` | Contract (Rust/Soroban) | `contracts/*/src/lib.rs`, `contracts/shared/` | `cargo test -p <contract>`, `cargo test --all` | `@core-contracts` |
+| `hard:api` | API (NestJS) | `api/src/**/*`, `api/src/seed/` | `npm run test`, `npm run test:e2e` | `@api-team` |
+| `hard:frontend` | Frontend (Angular) | `frontend/src/**/*` | `ng test`, `ng e2e` | `@ui-team` |
+| `hard:oracle` | Oracle (adapters + consumer) | `oracle/`, `api/src/oracle/`, `contracts/oracle-consumer/` | `cd oracle && npm test`, `cargo test -p oracle-consumer` | `@oracle-team` |
+| `hard:ops` | Ops/DevOps | `.github/workflows/`, `scripts/`, `docs/` | `npm run lint`, `cargo clippy` | `@maintainers` |
+
 ## Project Structure
 
 ```
@@ -135,6 +147,13 @@ chore(ci): add cargo-audit to workflow
 - Verify dialogs, menus, and dropdowns can be opened, used, and dismissed without losing focus.
 - Add or update automated accessibility assertions for shared controls when changing core workflows.
 
+### Feature Flags
+
+- Use feature flags for high-risk changes and large new feature rollouts.
+- Maintain safe defaults in `FeatureFlagsService` so that missing config safely disables or falls back to standard behavior.
+- Document rollout and rollback steps in [docs/feature_flags.md](docs/feature_flags.md).
+- Do not introduce breaking changes without a feature flag that can disable the new path.
+
 ## Testing
 
 ### Smart Contracts
@@ -181,6 +200,38 @@ cd oracle && npm test && cd ..
 # Or manually:
 docker compose up -d
 ```
+
+## Mutation Testing
+
+Mutation testing introduces controlled faults (mutants) into the codebase to verify that the test suite can detect them. This provides higher confidence that tests actually validate the critical financial and authorization paths.
+
+### Running Mutation Tests (API)
+
+```bash
+cd api
+npm run mutate     # Run stryker mutation testing
+npm run test:mutate # Run with threshold check (fails if score < 50%)
+```
+
+The mutation testing configuration is in `api/stryker-config.json`. Critical modules monitored:
+- Financial math: `api/src/bonds/`, `api/src/oracle/`
+- Authorization: `api/src/auth/`, `api/src/portfolio/`
+
+### Mutation Testing (Rust Contracts)
+
+Mutation testing for Soroban contracts can be run using `cargo-mut` or similar tools:
+
+```bash
+cd contracts
+cargo install cargo-mut
+cargo mut run --package <package-name>
+```
+
+### Interpreting Results
+
+- **Mutation score**: Percentage of mutants killed (detected) by the test suite
+- **Surviving mutants**: Indicate potential test gaps - triage and link to follow-up issues
+- **Threshold**: Initial gate at 50% for critical paths, aiming for 80%+ over time
 
 ## Pull Request Process
 
@@ -229,6 +280,17 @@ Use the [Feature Request template](.github/ISSUE_TEMPLATE/feature_request.md). I
 - Check existing [issues](https://github.com/prissca/verdant-bond-protocol/issues) and [discussions](https://github.com/prissca/verdant-bond-protocol/discussions)
 - Review [docs/](./docs/) for architecture and design details
 - Open a [discussion](https://github.com/prissca/verdant-bond-protocol/discussions) for questions
+
+## Role-Based Access Control (RBAC)
+
+Verdant Bond Protocol uses a centralized, consistently enforced role-based access control system across both API and UI boundaries. 
+The defined roles and their capabilities are:
+- **MAINTAINER**: Has all permissions. Usually assigned to the protocol admin.
+- **ISSUER**: Can create bonds, distribute coupons, mature bonds, export bonds, and approve/reject projects.
+- **INVESTOR**: Can subscribe to bonds, claim credits, and transfer bonds.
+- **SETTLEMENT_MANAGER**: Can reconcile holders, reindex holders, sweep undistributed funds, register oracle providers, and manage oracle incidents.
+
+Roles are granted based on wallet addresses matching configured environment variables (e.g., `ISSUER_PUBLIC_KEYS`, `SETTLEMENT_PUBLIC_KEYS`) or via the `STELLAR_PUBLIC_KEY` for the maintainer.
 
 ---
 

@@ -27,6 +27,7 @@ import { nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
 import { PaginatedResponse } from '../common/dto/pagination.dto';
 import { toBigIntString } from '../common/utils';
 import { ConfigService } from '../config/config.service';
+import { FeatureFlagsService, FeatureFlag } from '../config/feature-flags.service';
 import { normalizeQuoteAssetSymbol } from './quote-assets';
 
 
@@ -54,6 +55,7 @@ export class DexService {
     private readonly redis: RedisService,
     private readonly signingKeys: SigningKeyProvider,
     private readonly configService: ConfigService,
+    private readonly featureFlagsService: FeatureFlagsService,
   ) {}
 
   async listOrders(
@@ -61,39 +63,67 @@ export class DexService {
     status?: string,
     page = 1,
     limit = 20,
+    cursor?: string | number,
   ): Promise<PaginatedResponse<OrderResponse>> {
-    const cacheKey = `orders:${bondId || 'all'}:${status || 'all'}:${page}:${limit}`;
+    const cursorValue = typeof cursor === 'string' ? parseInt(cursor, 10) : cursor;
+    const cacheKey = cursorValue !== undefined
+      ? `orders:${bondId || 'all'}:${status || 'all'}:c:${cursorValue}:${limit}`
+      : `orders:${bondId || 'all'}:${status || 'all'}:${page}:${limit}`;
     const cached = await this.redis.get(cacheKey);
     if (cached) return JSON.parse(cached);
 
     const total = await this.getOrderCount();
+    const matchingOrders: OrderResponse[] = [];
+    
+    if (cursorValue !== undefined) {
+      let currentId = cursorValue + 1;
+      while (matchingOrders.length < limit && currentId <= total) {
+        const order = await this.tryGetOrder(currentId);
+        if (order && (!bondId || order.bondId === bondId) && (!status || order.status === status)) {
+          matchingOrders.push(order);
+        }
+        currentId++;
+      }
+      const nextCursor = currentId <= total ? currentId - 1 : undefined;
+      const result = {
+        data: matchingOrders,
+        meta: { limit, total: matchingOrders.length, nextCursor, totalPages: Math.ceil(matchingOrders.length / limit) || 1 }, // total here is tricky, maybe omit it or just provide what we found? Actually better to provide total count matching filter if we can, but since we can't efficiently, we might just provide matchingOrders.length + (nextCursor ? 1 : 0) ? No, let's just put `total` as the contract `total` or we can't do full count. Wait, the previous implementation fetched ALL orders to count them and paginate.
+      };
+      await this.redis.cacheSet(cacheKey, 30, JSON.stringify(result), ['orders']);
+      return result as any;
+    }
+
+    // Fallback for page-based offset, maintaining O(N) full fetch to know the exact total for offset stability,
+    // but without the skip/duplicate bug since we fetch all and filter.
     const ids = Array.from({ length: total }, (_unused, idx) => idx + 1);
-    const matchingOrders = (await Promise.all(ids.map((id) => this.tryGetOrder(id))))
+    const allMatching = (await Promise.all(ids.map((id) => this.tryGetOrder(id))))
       .filter((order): order is OrderResponse => Boolean(order))
       .filter((order) => !bondId || order.bondId === bondId)
       .filter((order) => !status || order.status === status);
     const start = (page - 1) * limit;
-    const paged = matchingOrders.slice(start, start + limit);
+    const paged = allMatching.slice(start, start + limit);
 
     const result = {
       data: paged,
       meta: {
         page,
         limit,
-        total: matchingOrders.length,
-        totalPages: Math.ceil(matchingOrders.length / limit) || 1,
+        total: allMatching.length,
+        totalPages: Math.ceil(allMatching.length / limit) || 1,
       },
     };
 
-    await this.redis.setEx(cacheKey, 30, JSON.stringify(result));
+    await this.redis.cacheSet(cacheKey, 30, JSON.stringify(result), ['orders']);
     return result;
   }
 
   async listBondTokens(dto: ListBondDto, sellerAddress: string): Promise<OrderResponse> {
+    if (!this.featureFlagsService.isEnabled(FeatureFlag.ENABLE_SECONDARY_MARKET)) {
+      throw new HttpException('Secondary market trading is currently disabled', HttpStatus.SERVICE_UNAVAILABLE);
+    }
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getDexRouterAddress(), sellerAddress);
 
-    const { result } = await this.contractService.invokeContractMethod(
+    const { result, transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getDexRouterAddress(), 'list_bond_tokens', adminSecret,
       [
         Address.fromString(sellerAddress).toScVal(),
@@ -103,14 +133,16 @@ export class DexService {
         nativeToScVal(dto.quoteAsset, { type: 'symbol' }),
         nativeToScVal(BigInt(dto.expiresAfterSeconds || 604800), { type: 'u64' }),
       ],
-      nonce,
+      sellerAddress,
     );
 
     const orderId = Number(scValToNative(result));
+    await this.redis.invalidateTag('orders');
+    await this.redis.invalidateTag('prices');
     await this.redis.delPattern(`orders:*`);
     await this.redis.del(`order:${orderId}`);
     await this.redis.del(`portfolio:${sellerAddress}`).catch(() => undefined);
-    return this.getOrder(orderId);
+    return { ...(await this.getOrder(orderId)), transactionHash };
   }
 
   /**
@@ -122,8 +154,21 @@ export class DexService {
    * contract call is attempted.
    */
   async buyBondTokens(dto: BuyBondDto, buyerAddress: string): Promise<OrderResponse> {
+    if (!this.featureFlagsService.isEnabled(FeatureFlag.ENABLE_SECONDARY_MARKET)) {
+      throw new HttpException('Secondary market trading is currently disabled', HttpStatus.SERVICE_UNAVAILABLE);
+    }
     const order = await this.fetchOrderFromLedger(dto.orderId);
     this.assertOrderIsActionable(order);
+    if (BigInt(dto.amount) > BigInt(order.amount)) {
+      throw new ConflictException(
+        `Stale quote: requested ${dto.amount} tokens but only ${order.amount} remain. Refresh and review the updated quote.`,
+      );
+    }
+    if (BigInt(dto.maxPrice) < BigInt(order.pricePerToken)) {
+      throw new ConflictException(
+        `Stale price: current price ${order.pricePerToken} exceeds your maximum ${dto.maxPrice}. Refresh and approve a new maximum.`,
+      );
+    }
     const proceeds = BigInt(order.pricePerToken) * BigInt(dto.amount);
 
     const escrowed = await this.getQuoteBalance(buyerAddress, order.quoteAsset);
@@ -135,10 +180,10 @@ export class DexService {
     }
 
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getDexRouterAddress(), buyerAddress);
 
+    let transactionHash: string | undefined;
     try {
-      await this.contractService.invokeContractMethod(
+      ({ transactionHash } = await this.contractService.invokeContractMethod(
         this.configService.getDexRouterAddress(), 'execute_purchase', adminSecret,
         [
           Address.fromString(buyerAddress).toScVal(),
@@ -146,16 +191,18 @@ export class DexService {
           nativeToScVal(BigInt(dto.maxPrice), { type: 'i128' }),
           nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
         ],
-        nonce,
-      );
+        buyerAddress,
+      ));
     } catch (error) {
       throw this.mapDexError(error);
     }
 
+    await this.redis.invalidateTag('orders');
+    await this.redis.invalidateTag('prices');
     await this.redis.delPattern(`orders:*`);
     await this.redis.del(`order:${dto.orderId}`);
     await this.redis.del(`portfolio:${buyerAddress}`).catch(() => undefined);
-    return this.getOrder(dto.orderId);
+    return { ...(await this.getOrder(dto.orderId)), transactionHash };
   }
 
   /**
@@ -171,7 +218,6 @@ export class DexService {
     this.assertOrderIsActionable(order);
 
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getDexRouterAddress(), callerAddress);
 
     try {
       await this.contractService.invokeContractMethod(
@@ -180,12 +226,14 @@ export class DexService {
           Address.fromString(callerAddress).toScVal(),
           nativeToScVal(BigInt(orderId), { type: 'u64' }),
         ],
-        nonce,
+        callerAddress,
       );
     } catch (error) {
       throw this.mapDexError(error);
     }
 
+    await this.redis.invalidateTag('orders');
+    await this.redis.invalidateTag('prices');
     await this.redis.delPattern(`orders:*`);
     await this.redis.del(`order:${orderId}`);
     await this.redis.del(`portfolio:${callerAddress}`).catch(() => undefined);
@@ -203,7 +251,7 @@ export class DexService {
   }
 
   /** Reads the order directly from the ledger, bypassing the Redis cache entirely. */
-  private async fetchOrderFromLedger(orderId: number): Promise<OrderResponse> {
+  async fetchOrderFromLedger(orderId: number): Promise<OrderResponse> {
     const orderScVal = await this.contractService.simulateCall({
       contractAddress: this.configService.getDexRouterAddress(),
       method: 'get_order',
@@ -250,7 +298,6 @@ export class DexService {
     callerAddress: string,
   ): Promise<QuoteTransactionResponse> {
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getDexRouterAddress(), callerAddress);
 
     const { transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getDexRouterAddress(), 'deposit_quote', adminSecret,
@@ -259,10 +306,12 @@ export class DexService {
         nativeToScVal(dto.asset, { type: 'symbol' }),
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
       ],
-      nonce,
+      callerAddress,
     );
 
     await this.redis.del(`portfolio:${callerAddress}`).catch(() => undefined);
+    await this.invalidateQuoteBalanceIndex(callerAddress, dto.asset);
+
     return { address: callerAddress, asset: dto.asset, amount: dto.amount, transactionHash };
   }
 
@@ -271,7 +320,6 @@ export class DexService {
     callerAddress: string,
   ): Promise<QuoteTransactionResponse> {
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getDexRouterAddress(), callerAddress);
 
     const { transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getDexRouterAddress(), 'withdraw_quote', adminSecret,
@@ -280,11 +328,37 @@ export class DexService {
         nativeToScVal(dto.asset, { type: 'symbol' }),
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
       ],
-      nonce,
+      callerAddress,
     );
 
     await this.redis.del(`portfolio:${callerAddress}`).catch(() => undefined);
+    await this.invalidateQuoteBalanceIndex(callerAddress, dto.asset);
+
     return { address: callerAddress, asset: dto.asset, amount: dto.amount, transactionHash };
+  }
+
+  private quoteBalanceIndexKey(address: string, asset: QuoteAsset): string {
+    return `quote:balance:${address}:${asset}`;
+  }
+
+  /**
+   * Reconciliation (#recon): the API/indexed view of a wallet's escrowed quote
+   * balance. The reconciliation job compares this against the on-chain
+   * `get_quote_balance` value. Deposit/withdraw keep it fresh by evicting it;
+   * a missed eviction is exactly what reconciliation surfaces as a balance
+   * mismatch (a "stale cache" divergence).
+   */
+  async getIndexedQuoteBalance(address: string, asset: QuoteAsset): Promise<string | null> {
+    return this.redis.get(this.quoteBalanceIndexKey(address, asset));
+  }
+
+  async setIndexedQuoteBalance(address: string, asset: QuoteAsset, balance: string): Promise<void> {
+    await this.redis.setEx(this.quoteBalanceIndexKey(address, asset), 86_400, balance);
+  }
+
+  private async invalidateQuoteBalanceIndex(address: string, assetSymbol: string): Promise<void> {
+    const asset = normalizeQuoteAssetSymbol(assetSymbol);
+    await this.redis.del(this.quoteBalanceIndexKey(address, asset));
   }
 
   private decodeOrder(data: any[]): OrderResponse {
@@ -299,6 +373,7 @@ export class DexService {
       quoteAsset: data[5] as QuoteAsset,
       status: this.deriveEffectiveStatus(rawStatus, expiresAtSeconds),
       createdAt: new Date(Number(data[7]) * 1000).toISOString(),
+      expiresAt: new Date(expiresAtSeconds * 1000).toISOString(),
     };
   }
 
@@ -349,7 +424,6 @@ export class DexService {
     const adminAddress = this.stellarService
       .getKeypairFromSecret(adminSecret)
       .publicKey();
-    const nonce = await this.nonceService.next(this.configService.getDexRouterAddress(), adminAddress);
 
     const { result } = await this.contractService.invokeContractMethod(
       this.configService.getDexRouterAddress(),
@@ -360,7 +434,7 @@ export class DexService {
         nativeToScVal(BigInt(startId), { type: 'u64' }),
         nativeToScVal(limit, { type: 'u32' }),
       ],
-      nonce,
+      adminAddress,
     );
 
     const decoded = scValToNative(result) as { cleaned?: number; next_start_id?: number } | unknown[];
@@ -376,7 +450,7 @@ export class DexService {
     };
   }
 
-  private async getOrderCount(): Promise<number> {
+  async getOrderCount(): Promise<number> {
     const countScVal = await this.contractService.simulateCall({
       contractAddress: this.configService.getDexRouterAddress(),
       method: 'order_count',
@@ -399,10 +473,6 @@ export class DexService {
   }
 
   private mapDexError(error: unknown): Error {
-    if (error instanceof HttpException) {
-      return error;
-    }
-
     if (error instanceof ContractException) {
       const code = error.rawErrorCode as number | undefined;
       if (code === DEX_ERROR_CODE.InsufficientFunds) {

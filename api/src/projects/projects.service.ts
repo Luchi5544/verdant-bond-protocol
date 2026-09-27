@@ -7,9 +7,10 @@ import { RedisService } from '../common/services/redis.service';
 import { SigningKeyProvider } from '../common/services/signing-key.provider';
 import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
 import { CreateProjectDto } from './dto/create-project.dto';
-import { ProjectResponse, ProjectStatusEnum, DocumentUploadResponse } from './interfaces/project.interface';
+import { ProjectResponse, ProjectStatusEnum, DocumentUploadResponse, ProjectProvenanceResponse, ProvenanceEvent } from './interfaces/project.interface';
 import { encodeCid, decodeCid, toBigIntString } from '../common/utils';
 import { ConfigService } from '../config/config.service';
+import { validateGeoJsonBoundary } from './utils/geojson-validator';
 import * as crypto from 'crypto';
 
 
@@ -27,6 +28,25 @@ export class ProjectsService {
   ) {}
 
   async register(dto: CreateProjectDto, ownerAddress: string): Promise<ProjectResponse> {
+    try {
+      Address.fromString(ownerAddress);
+    } catch {
+      throw new BadRequestException('Authenticated wallet address is required');
+    }
+
+    let boundaryData: Record<string, any> = {};
+    if (dto.boundary) {
+      try {
+        const validation = validateGeoJsonBoundary(dto.boundary, dto.totalAreaHa);
+        boundaryData = {
+          boundary: validation.geometry,
+          boundaryHash: validation.boundaryHash,
+          boundaryAreaHa: validation.areaHa,
+        };
+      } catch (err: any) {
+        throw new BadRequestException(`Geospatial boundary validation failed: ${err.message}`);
+      }
+    }
     const metadata = {
       name: dto.name,
       methodology: dto.methodology,
@@ -37,6 +57,7 @@ export class ProjectsService {
       blueCarbon: dto.blueCarbon ?? false,
       biodiversityCorridor: dto.biodiversityCorridor ?? false,
       description: dto.description ?? '',
+      ...boundaryData,
       timestamp: new Date().toISOString(),
     };
 
@@ -44,9 +65,8 @@ export class ProjectsService {
     const ipfsHash = encodeCid(ipfsResult.hash);
 
     const ownerSecret = this.signingKeys.userSecret();
-    const nonce = await this.nonceService.next(this.configService.getProjectRegistryAddress(), ownerAddress);
 
-    const { result } = await this.contractService.invokeContractMethod(
+    const { result, transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getProjectRegistryAddress(), 'register_project', ownerSecret,
       [
         Address.fromString(ownerAddress).toScVal(),
@@ -54,7 +74,7 @@ export class ProjectsService {
         nativeToScVal(dto.methodology, { type: 'symbol' }),
         nativeToScVal(dto.country, { type: 'symbol' }),
       ],
-      nonce,
+      ownerAddress,
     );
 
     const projectId = Number(scValToNative(result));
@@ -62,11 +82,12 @@ export class ProjectsService {
 
     await this.redis.setEx(`project:${projectId}`, 300, JSON.stringify(project));
 
-    return project;
+    return { ...project, transactionHash };
   }
 
-  async findAll(page = 1, limit = 20) {
-    const cacheKey = `projects:${page}:${limit}`;
+  async findAll(page = 1, limit = 20, cursor?: string | number) {
+    const cursorValue = typeof cursor === 'string' ? parseInt(cursor, 10) : cursor;
+    const cacheKey = cursorValue !== undefined ? `projects:c:${cursorValue}:${limit}` : `projects:${page}:${limit}`;
     const cached = await this.redis.get(cacheKey);
     if (cached) return JSON.parse(cached);
 
@@ -79,15 +100,45 @@ export class ProjectsService {
     } catch {}
 
     const projects: ProjectResponse[] = [];
-    const start = (page - 1) * limit;
-    const end = Math.min(start + limit, total);
-
-    for (let id = 1; id <= total; id++) {
-      if (id > start && id <= end) {
+    
+    if (cursorValue !== undefined) {
+      let currentId = cursorValue + 1;
+      while (projects.length < limit && currentId <= total) {
         try {
-          projects.push(await this.buildProjectResponse(id));
+          // If buildProjectResponse throws due to hidden or deleted status, the record is skipped.
+          // Because we iterate deterministically, these skips don't shift offsets.
+          projects.push(await this.buildProjectResponse(currentId));
         } catch {}
+        currentId++;
       }
+      const nextCursor = currentId <= total ? currentId - 1 : undefined;
+      const result = {
+        data: projects,
+        meta: { limit, total, nextCursor, totalPages: Math.ceil(total / limit) || 1 },
+      };
+      await this.redis.setEx(cacheKey, 60, JSON.stringify(result));
+      return result;
+    }
+
+    const start = (page - 1) * limit;
+    let skipped = 0;
+    let currentId = 1;
+    
+    while (skipped < start && currentId <= total) {
+      try {
+        // Skip hidden/deleted records during offset traversal
+        await this.buildProjectResponse(currentId);
+        skipped++;
+      } catch {}
+      currentId++;
+    }
+
+    while (projects.length < limit && currentId <= total) {
+      try {
+        // Skip hidden/deleted records while fulfilling limit
+        projects.push(await this.buildProjectResponse(currentId));
+      } catch {}
+      currentId++;
     }
 
     const result = {
@@ -111,12 +162,11 @@ export class ProjectsService {
   async approve(id: number): Promise<ProjectResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
-    const nonce = await this.nonceService.next(this.configService.getProjectRegistryAddress(), adminAddress);
 
     await this.contractService.invokeContractMethod(
       this.configService.getProjectRegistryAddress(), 'approve_project', adminSecret,
       [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
-      nonce,
+      adminAddress,
     );
 
     await this.redis.del(`project:${id}`);
@@ -126,12 +176,11 @@ export class ProjectsService {
   async reject(id: number): Promise<ProjectResponse> {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
-    const nonce = await this.nonceService.next(this.configService.getProjectRegistryAddress(), adminAddress);
 
     await this.contractService.invokeContractMethod(
       this.configService.getProjectRegistryAddress(), 'reject_project', adminSecret,
       [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
-      nonce,
+      adminAddress,
     );
 
     await this.redis.del(`project:${id}`);
@@ -153,6 +202,42 @@ export class ProjectsService {
     await this.redis.set(`project:${id}:documents`, JSON.stringify(allHashes));
 
     return { projectId: id, documentHashes, gatewayUrls };
+  }
+
+  async getProvenance(id: number): Promise<ProjectProvenanceResponse> {
+    const snapshot = await this.exportProject(id, 'system');
+    const project = await this.findOne(id);
+    const events: ProvenanceEvent[] = [{
+      type: 'registration',
+      occurredAt: project.createdAt,
+      title: 'Project registered',
+      status: 'complete',
+      reference: project.metadataIpfsHash,
+      evidenceUrl: `https://gateway.pinata.cloud/ipfs/${project.metadataIpfsHash}`,
+    }];
+    if (project.status === ProjectStatusEnum.Pending) {
+      events.push({ type: 'review', occurredAt: null, title: 'Review pending', status: 'pending' });
+    } else {
+      events.push({ type: 'review', occurredAt: null, title: `Project ${project.status.toLowerCase()}`, status: 'complete' });
+    }
+    for (const report of snapshot.reports) {
+      const reportStatus = report.status === 'Pending' || report.status === 0
+        ? 'pending'
+        : report.ipfsEvidenceHash ? 'complete' : 'stale';
+      events.push({
+        type: 'report', occurredAt: report.createdAt ?? null,
+        title: `Oracle report #${report.id}`, status: reportStatus,
+        reference: String(report.id), evidenceUrl: report.ipfsEvidenceHash ? `https://gateway.pinata.cloud/ipfs/${report.ipfsEvidenceHash}` : undefined,
+      });
+    }
+    for (const bondId of snapshot.relatedBonds) {
+      events.push({ type: 'bond', occurredAt: null, title: `Bond #${bondId} issued`, status: 'complete', reference: String(bondId), evidenceUrl: `/bonds/${bondId}` });
+    }
+    for (const hash of snapshot.documents) {
+      events.push({ type: 'document', occurredAt: null, title: 'Project document added', status: 'complete', reference: hash, evidenceUrl: `https://gateway.pinata.cloud/ipfs/${hash}` });
+    }
+    events.sort((a, b) => (a.occurredAt && b.occurredAt ? a.occurredAt.localeCompare(b.occurredAt) : a.occurredAt ? -1 : b.occurredAt ? 1 : 0));
+    return { projectId: id, events };
   }
 
   private async buildProjectResponse(id: number): Promise<ProjectResponse> {
@@ -179,7 +264,7 @@ export class ProjectsService {
       ownerAddress: (project[1] as any).toString?.() || '',
       totalAreaHa: metadata.totalAreaHa || 0,
       carbonSequestrationEstimate: metadata.carbonSequestrationEstimate || 0,
-      createdAt: new Date().toISOString(),
+      createdAt: metadata.timestamp || new Date().toISOString(),
     };
   }
 

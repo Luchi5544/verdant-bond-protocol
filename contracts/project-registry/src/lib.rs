@@ -1,6 +1,62 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
 use nbbs_shared::{ProjectStatus, RegistryError};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, events::Event, vec, Address, BytesN, Env, IntoVal,
+    Symbol, Val, Vec,
+};
+
+/// Issue #188: versioned-interface convention. Bump on a breaking storage
+/// layout or interface change; see docs/upgrade-migrations.md.
+pub const SCHEMA_VERSION: u32 = 1;
+
+
+#[derive(Clone)]
+pub enum RegistryEvent {
+    ProjectRegistered {
+        id: u64,
+        owner: Address,
+        methodology: Symbol,
+        country: Symbol,
+    },
+    ProjectApproved {
+        id: u64,
+        caller: Address,
+    },
+    ProjectRejected {
+        id: u64,
+        caller: Address,
+    },
+    AdminChanged {
+        prev: Address,
+        new: Address,
+    },
+}
+
+impl Event for RegistryEvent {
+    fn topics(&self, env: &Env) -> Vec<Val> {
+        let name = match self {
+            RegistryEvent::ProjectRegistered { .. } => "project_registered",
+            RegistryEvent::ProjectApproved { .. } => "project_approved",
+            RegistryEvent::ProjectRejected { .. } => "project_rejected",
+            RegistryEvent::AdminChanged { .. } => "admin_changed",
+        };
+        vec![&env, Symbol::new(env, name).into_val(env)]
+    }
+
+    fn data(&self, env: &Env) -> Val {
+        match self {
+            RegistryEvent::ProjectRegistered {
+                id,
+                owner,
+                methodology,
+                country,
+            } => (*id, owner.clone(), methodology.clone(), country.clone()).into_val(env),
+            RegistryEvent::ProjectApproved { id, caller } => (*id, caller.clone()).into_val(env),
+            RegistryEvent::ProjectRejected { id, caller } => (*id, caller.clone()).into_val(env),
+            RegistryEvent::AdminChanged { prev, new } => (prev.clone(), new.clone()).into_val(env),
+        }
+    }
+}
 
 #[derive(Clone)]
 #[contracttype]
@@ -76,6 +132,13 @@ impl ProjectRegistry {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
+    pub fn get_nonce(env: Env, address: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Nonce(address))
+            .unwrap_or(0)
+    }
+
     pub fn register_project(
         env: Env,
         caller: Address,
@@ -127,10 +190,13 @@ impl ProjectRegistry {
             .instance()
             .set(&DataKey::Project(key), &project);
 
-        env.events().publish(
-            (Symbol::new(&env, "project_registered"),),
-            (new_id, caller.clone(), project.methodology.clone(), project.country.clone()),
-        );
+        env.events()
+            .publish_event(&RegistryEvent::ProjectRegistered {
+                id: new_id,
+                owner: caller.clone(),
+                methodology: project.methodology.clone(),
+                country: project.country.clone(),
+            });
 
         let mut owner_projects: Vec<u64> = env
             .storage()
@@ -183,10 +249,10 @@ impl ProjectRegistry {
             .instance()
             .set(&DataKey::Project(key), &project);
 
-        env.events().publish(
-            (Symbol::new(&env, "project_approved"),),
-            (project_id, caller),
-        );
+        env.events().publish_event(&RegistryEvent::ProjectApproved {
+            id: project_id,
+            caller,
+        });
 
         Ok(())
     }
@@ -229,10 +295,10 @@ impl ProjectRegistry {
             .instance()
             .set(&DataKey::Project(key), &project);
 
-        env.events().publish(
-            (Symbol::new(&env, "project_rejected"),),
-            (project_id, caller),
-        );
+        env.events().publish_event(&RegistryEvent::ProjectRejected {
+            id: project_id,
+            caller,
+        });
 
         Ok(())
     }
@@ -334,6 +400,21 @@ impl ProjectRegistry {
         }
     }
 
+    /// Returns the methodology symbol for a project keyed by its `BytesN<32>`
+    /// identifier, or an empty symbol when no such project exists. The
+    /// `BondIssuer` cross-invokes this on issuance to enforce methodology /
+    /// credit-type compatibility without coupling to the numeric internal id.
+    pub fn get_project_methodology(env: Env, key: BytesN<32>) -> Symbol {
+        match env
+            .storage()
+            .instance()
+            .get::<_, Project>(&DataKey::Project(key))
+        {
+            Some(project) => project.methodology,
+            None => Symbol::new(&env, ""),
+        }
+    }
+
     pub fn project_key(env: Env, project_id: u64) -> BytesN<32> {
         project_id_to_bytes(&env, project_id)
     }
@@ -395,27 +476,52 @@ impl ProjectRegistry {
             .unwrap_or(vec![&env])
     }
 
+    /// Replaces the supporting-document hashes for a project. Only the
+    /// project owner or the admin may do this: the list is what auditors and
+    /// bond investors read, so an unauthenticated write would let anyone swap
+    /// a project's evidence.
     pub fn add_project_documents(
         env: Env,
+        caller: Address,
         project_id: u64,
         document_hashes: Vec<BytesN<32>>,
+        nonce: u64,
     ) -> Result<(), RegistryError> {
+        caller.require_auth();
+
+        let expected_nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Nonce(caller.clone()))
+            .unwrap_or(0);
+        if nonce != expected_nonce {
+            return Err(RegistryError::InvalidNonce);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(caller.clone()), &(expected_nonce + 1));
+
         if document_hashes.len() > MAX_DOCUMENTS {
             return Err(RegistryError::InvalidArgument);
         }
-        let key = DataKey::ProjectDocuments(project_id);
-        env.storage()
+
+        let project: Project = env
+            .storage()
             .instance()
-            .set(&key, &document_hashes);
+            .get(&DataKey::Project(project_id_to_bytes(&env, project_id)))
+            .ok_or(RegistryError::ProjectNotFound)?;
+        if project.owner != caller && require_admin(&env, &caller).is_err() {
+            return Err(RegistryError::Unauthorized);
+        }
+
+        let key = DataKey::ProjectDocuments(project_id);
+        env.storage().instance().set(&key, &document_hashes);
         Ok(())
     }
 
     pub fn get_project_documents(env: Env, project_id: u64) -> Vec<BytesN<32>> {
         let key = DataKey::ProjectDocuments(project_id);
-        env.storage()
-            .instance()
-            .get(&key)
-            .unwrap_or(vec![&env])
+        env.storage().instance().get(&key).unwrap_or(vec![&env])
     }
 
     pub fn set_admin(
@@ -434,10 +540,10 @@ impl ProjectRegistry {
 
         require_admin(&env, &current_admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish(
-            (Symbol::new(&env, "admin_changed"),),
-            (current_admin, new_admin),
-        );
+        env.events().publish_event(&RegistryEvent::AdminChanged {
+            prev: current_admin,
+            new: new_admin,
+        });
 
         Ok(())
     }
@@ -447,6 +553,12 @@ impl ProjectRegistry {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(RegistryError::NotInitialized)
+    /// Issue #188: versioned-interface convention — bump when the contract's
+    /// storage layout or callable interface changes in a breaking way. See
+    /// docs/upgrade-migrations.md.
+    pub fn schema_version(env: Env) -> u32 {
+        let _ = env;
+        SCHEMA_VERSION
     }
 }
 
@@ -899,6 +1011,42 @@ mod test {
         let (_env, client, admin, _user) = setup();
         let result = client.try_deactivate_project(&admin, &999, &0);
         assert_eq!(result, Err(Ok(RegistryError::ProjectNotFound)));
+    }
+
+    #[test]
+    fn test_project_documents_owner_and_admin_only() {
+        let (env, client, admin, user) = setup();
+        let id = client.register_project(
+            &user,
+            &create_hash(&env, 1),
+            &Symbol::new(&env, "VCS"),
+            &Symbol::new(&env, "US"),
+            &0,
+        );
+        let docs = vec![&env, create_hash(&env, 10), create_hash(&env, 11)];
+
+        client.add_project_documents(&user, &id, &docs, &1);
+        assert_eq!(client.get_project_documents(&id), docs);
+
+        let admin_docs = vec![&env, create_hash(&env, 12)];
+        client.add_project_documents(&admin, &id, &admin_docs, &0);
+        assert_eq!(client.get_project_documents(&id), admin_docs);
+
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_add_project_documents(&stranger, &id, &docs, &0),
+            Err(Ok(RegistryError::Unauthorized))
+        );
+        assert_eq!(client.get_project_documents(&id), admin_docs);
+
+        assert_eq!(
+            client.try_add_project_documents(&user, &99, &docs, &2),
+            Err(Ok(RegistryError::ProjectNotFound))
+        );
+        assert_eq!(
+            client.try_add_project_documents(&user, &id, &docs, &1),
+            Err(Ok(RegistryError::InvalidNonce))
+        );
     }
 
     #[test]

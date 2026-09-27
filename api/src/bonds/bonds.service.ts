@@ -1,7 +1,10 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, ForbiddenException, Optional } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { ContractException } from '../stellar/contract-errors';
 import { StellarService } from '../stellar/stellar.service';
+import { ComplianceAttestationService } from '../compliance/services/compliance-attestation.service';
+import { ComplianceRulesEngine } from '../compliance/services/compliance-rules.engine';
+import { TrancheType } from '../compliance/interfaces/compliance.interface';
 import { NonceService } from '../common/services/nonce.service';
 import { RedisService } from '../common/services/redis.service';
 import { SigningKeyProvider } from '../common/services/signing-key.provider';
@@ -23,12 +26,17 @@ import {
   TransferResponse,
   UndistributedTotalResponse,
   SweepUndistributedResponse,
+  BondDetailResponse,
   BondStatusEnum,
   BondMaturityStatusEnum,
   CreditTypeEnum,
+  ClaimableCreditDetail,
+  ClaimableCreditsResponse,
 } from './interfaces/bond.interface';
 import { toBigIntString } from '../common/utils';
 import { ConfigService } from '../config/config.service';
+import { OracleService } from '../oracle/oracle.service';
+import { ReportStatus } from '../oracle/interfaces/oracle.interface';
 
 const BOND_ERROR_CODE = {
   NotInitialized: 1,
@@ -53,6 +61,9 @@ export class BondsService {
     private readonly signingKeys: SigningKeyProvider,
     private readonly configService: ConfigService,
     private readonly holderIndex: HolderIndexService,
+    @Optional() private readonly oracleService?: OracleService,
+    @Optional() private readonly complianceAttestation?: ComplianceAttestationService,
+    @Optional() private readonly complianceRulesEngine?: ComplianceRulesEngine,
   ) {}
 
   async create(dto: CreateBondDto): Promise<BondResponse> {
@@ -62,16 +73,16 @@ export class BondsService {
 
     const configScVal = this.encodeBondConfig(dto);
 
-    const { result } = await this.contractService.invokeContractMethod(
+    const { result, transactionHash } = await this.contractService.invokeContractMethod(
       this.configService.getBondIssuerAddress(), 'issue_bond', adminSecret,
       [Address.fromString(adminAddress).toScVal(), configScVal],
-      nonce,
+      adminAddress,
     );
 
     const bondId = Number(scValToNative(result));
     const bond = await this.buildBondResponse(bondId);
     await this.redis.setEx(`bond:${bondId}`, 300, JSON.stringify(bond));
-    return bond;
+    return { ...bond, transactionHash };
   }
 
   async findAll(page = 1, limit = 20) {
@@ -153,6 +164,8 @@ export class BondsService {
   }
 
   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+    await this.verifySubscriptionEligibility(id, dto);
+
     const investorSecret = this.signingKeys.investorSecret();
     const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), dto.investorAddress);
     const { transactionHash } = await this.contractService.invokeContractMethod(
@@ -162,7 +175,7 @@ export class BondsService {
         nativeToScVal(BigInt(id), { type: 'u64' }),
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
       ],
-      nonce,
+      dto.investorAddress,
     );
 
     await this.redis.del(`bond:${id}`);
@@ -172,9 +185,103 @@ export class BondsService {
     return { bondId: id, investorAddress: dto.investorAddress, amount: toBigIntString(dto.amount), transactionHash: transactionHash || '' };
   }
 
+  private async verifySubscriptionEligibility(bondId: number, dto: SubscribeDto): Promise<void> {
+    const isRestrictedTranche = dto.tranche === TrancheType.RESTRICTED_ACCREDITED;
+
+    // 1. Sanctions check (if compliance rules engine and sanctions service are available)
+    if (this.complianceRulesEngine?.getSanctionsService()?.isSanctioned(dto.investorAddress)) {
+      throw new ForbiddenException(
+        `Investor address ${dto.investorAddress} is blocked under active sanctions screening`,
+      );
+    }
+
+    // 2. Restricted tranche requires signed attestation
+    if (isRestrictedTranche) {
+      if (!dto.attestation) {
+        throw new ForbiddenException(
+          'Restricted tranche requires a signed eligibility attestation issued after KYC completion',
+        );
+      }
+      if (this.complianceAttestation) {
+        const verification = this.complianceAttestation.verifyAttestation(dto.attestation, {
+          expectedInvestor: dto.investorAddress,
+          expectedBondId: bondId,
+          expectedTranche: dto.tranche,
+        });
+        if (!verification.valid) {
+          throw new ForbiddenException(
+            `Eligibility attestation verification failed: ${verification.reason}`,
+          );
+        }
+      }
+    } else if (dto.attestation && this.complianceAttestation) {
+      // Optional attestation verification on standard tranches
+      const verification = this.complianceAttestation.verifyAttestation(dto.attestation, {
+        expectedInvestor: dto.investorAddress,
+        expectedBondId: bondId,
+        expectedTranche: dto.tranche,
+      });
+      if (!verification.valid) {
+        throw new ForbiddenException(
+          `Eligibility attestation verification failed: ${verification.reason}`,
+        );
+      }
+    }
+
+    // 3. Jurisdiction rules evaluation if specified or in attestation
+    if (this.complianceRulesEngine && (dto.jurisdiction || dto.attestation)) {
+      const jurisdiction = dto.jurisdiction || dto.attestation?.payload?.jurisdiction || 'GLOBAL';
+      const decision = this.complianceRulesEngine.evaluateEligibility({
+        investorAddress: dto.investorAddress,
+        bondId,
+        tranche: dto.tranche || TrancheType.STANDARD,
+        jurisdiction,
+        purchaseAmount: dto.amount != null ? String(dto.amount) : undefined,
+        kycRecord: dto.attestation?.payload
+          ? {
+              status: dto.attestation.payload.kycStatus,
+            }
+          : undefined,
+      });
+
+      if (!decision.eligible) {
+        throw new ForbiddenException(
+          `Investor eligibility check failed: [${decision.code}] ${decision.reason}`,
+        );
+      }
+    }
+  }
+
   async getHolders(id: number): Promise<HolderListResponse> {
     const holders = await this.holderIndex.getHoldersWithBalances(id);
     return { bondId: id, holders, total: holders.length };
+  }
+
+  /**
+   * Atomically refresh every panel of a bond's detail (issue #4). Fetches the
+   * bond summary, holders, and coupon undistributed total together and derives
+   * a single maturity status, so callers never commit a mix of pre- and
+   * post-mutation values. `loadedAt` lets the client refresh model detect
+   * staleness against its own `lastLoadedAt`.
+   */
+  async getBondDetail(id: number): Promise<BondDetailResponse> {
+    const bond = await this.buildBondResponse(id);
+    const [holdersResponse, couponResponse] = await Promise.all([
+      this.getHolders(id),
+      this.getUndistributedTotal(id),
+    ]);
+
+    const now = Math.floor(Date.now() / 1000);
+    const reached = bond.status === BondStatusEnum.Matured || now >= bond.maturityDate;
+    const secondsUntil = reached ? 0 : bond.maturityDate - now;
+
+    return {
+      bond,
+      holders: holdersResponse.holders,
+      coupon: { undistributedTotal: couponResponse.undistributedTotal },
+      maturity: { reached, date: bond.maturityDate, secondsUntil },
+      loadedAt: new Date().toISOString(),
+    };
   }
 
   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
@@ -183,6 +290,23 @@ export class BondsService {
     const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
 
     const holderAddresses = await this.holderIndex.getHoldersForCoupon(id, { requireFresh: true });
+    // Challenge linkage (#oracle-challenge): a coupon pays out on the carbon
+    // data in the referenced oracle report. If that report is Challenged or
+    // Rejected, the data is disputed and must not be paid on, so block before
+    // any contract call is made. The oracle dependency is optional so the bond
+    // module keeps working where the oracle module is not wired in.
+    if (this.oracleService) {
+      const report = await this.oracleService.getReport(dto.reportId);
+      if (report.status === ReportStatus.Challenged) {
+        throw new BadRequestException(
+          `Cannot distribute coupon: report ${report.id} is currently Challenged. ` +
+            'Resolve the challenge before distributing.',
+        );
+      }
+      if (report.status === ReportStatus.Rejected) {
+        throw new BadRequestException(`Cannot distribute coupon: report ${report.id} was Rejected.`);
+      }
+    }
 
     const { result } = await this.contractService.invokeContractMethod(
       this.configService.getCouponEngineAddress(), 'distribute_coupon', adminSecret,
@@ -193,7 +317,7 @@ export class BondsService {
         xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
         nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
       ],
-      nonce,
+      adminAddress,
     );
 
     const parsed = scValToNative(result) as any[];
@@ -215,7 +339,7 @@ export class BondsService {
         Address.fromString(dto.investorAddress).toScVal(),
         nativeToScVal(BigInt(id), { type: 'u64' }),
       ],
-      nonce,
+      dto.investorAddress,
     );
 
     this.invalidatePortfolio(dto.investorAddress);
@@ -240,7 +364,7 @@ export class BondsService {
         nativeToScVal(BigInt(id), { type: 'u64' }),
         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
       ],
-      nonce,
+      dto.fromAddress,
     );
 
     await this.holderIndex.recordTransfer(id, dto.fromAddress, dto.toAddress);
@@ -315,14 +439,47 @@ export class BondsService {
       try {
         const scVal = await this.contractService.simulateCall({
           contractAddress: this.configService.getCouponEngineAddress(),
-          method: 'get_claimable_credits',
-          args: [Address.fromString(address).toScVal(), nativeToScVal(BigInt(bond.id), { type: 'u64' })],
+          method: 'claimable_credits',
+          args: [nativeToScVal(BigInt(bond.id), { type: 'u64' }), Address.fromString(address).toScVal()],
         });
         const amount = toBigIntString(scValToNative(scVal));
         if (amount !== '0') out.push({ bondId: bond.id, amount });
       } catch {}
     }
     return out;
+  }
+
+  /**
+   * Itemized claimable-credit provenance for a single holder on a single bond
+   * (issue #156). Surfaces every period/report/type line so the UI can group
+   * claimable credits exactly as `claim_credits` clears them.
+   */
+  async getClaimableCreditDetails(
+    bondId: number,
+    address?: string,
+  ): Promise<ClaimableCreditsResponse> {
+    if (!address) {
+      throw new BadRequestException('Wallet address is required');
+    }
+    try {
+      Address.fromString(address);
+    } catch {
+      throw new BadRequestException('Invalid wallet address');
+    }
+
+    const scVal = await this.contractService.simulateCall({
+      contractAddress: this.configService.getCouponEngineAddress(),
+      method: 'claimable_credit_details',
+      args: [nativeToScVal(BigInt(bondId), { type: 'u64' }), Address.fromString(address).toScVal()],
+    });
+
+    const raw = scValToNative(scVal);
+    const details = Array.isArray(raw)
+      ? raw.map((entry) => decodeClaimableCreditDetail(entry))
+      : [];
+
+    const total = details.reduce((sum, line) => sum + BigInt(line.amount), 0n);
+    return { bondId, address, total: total.toString(), details };
   }
 
   /**
@@ -386,7 +543,7 @@ export class BondsService {
         Address.fromString(adminAddress).toScVal(),
         nativeToScVal(BigInt(id), { type: 'u64' }),
       ],
-      nonce,
+      adminAddress,
     );
 
     return {
@@ -405,7 +562,7 @@ export class BondsService {
       await this.contractService.invokeContractMethod(
         this.configService.getBondIssuerAddress(), 'mature_bond', adminSecret,
         [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
-        nonce,
+        adminAddress,
       );
     } catch (error) {
       throw this.mapBondError(error, id);
@@ -425,6 +582,26 @@ export class BondsService {
       nativeToScVal(BigInt(dto.maturityDate), { type: 'u64' }),
       nativeToScVal(BigInt(dto.totalSupply), { type: 'i128' }),
     ]);
+  }
+
+  async previewSubscribe(
+    id: number,
+    amount: number,
+  ): Promise<{ remaining_supply: number; requested_amount: number; expected_failure: string | null }> {
+    const rawResult = await this.contractService.simulateCall({
+      contractAddress: this.configService.getBondIssuerAddress(),
+      method: 'preview_subscribe',
+      args: [
+        nativeToScVal(BigInt(id), { type: 'u64' }),
+        nativeToScVal(BigInt(amount), { type: 'i128' }),
+      ],
+    });
+    const parsed = scValToNative(rawResult);
+    return {
+      remaining_supply: Number(parsed?.remaining_supply ?? 0),
+      requested_amount: Number(parsed?.requested_amount ?? amount),
+      expected_failure: parsed?.expected_failure != null ? String(parsed.expected_failure) : null,
+    };
   }
 
   private async buildBondResponse(id: number): Promise<BondResponse> {
@@ -619,4 +796,59 @@ export class BondsService {
   private getAdminSecret(): string {
     return this.signingKeys.adminSecret();
   }
+}
+
+/** Coerce a bigint/number SCVal field into a JS number. */
+function toNumber(value: unknown): number {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'bigint') return Number(value);
+  return Number(value ?? 0);
+}
+
+/**
+ * Defensively decode a single `ClaimableCreditDetail` tuple. The contracttype
+ * struct round-trips as either an object (map form) or a positional array,
+ * depending on the XDR encoder version.
+ */
+function decodeClaimableCreditDetail(raw: unknown): ClaimableCreditDetail {
+  if (Array.isArray(raw)) {
+    const [periodIndex, reportId, startTime, endTime, creditType, amount] = raw;
+    return {
+      periodIndex: toNumber(periodIndex),
+      reportId: toNumber(reportId),
+      startTime: toNumber(startTime),
+      endTime: toNumber(endTime),
+      creditType: String(creditType),
+      amount: toBigIntString(amount),
+    };
+  }
+
+  const entry = (raw ?? {}) as Record<string, unknown>;
+  const pick = (key: string) => entry[key] ?? entry[toCamelCase(key)];
+  return {
+    periodIndex: toNumber(pick('period_index')),
+    reportId: toNumber(pick('report_id')),
+    startTime: toNumber(pick('start_time')),
+    endTime: toNumber(pick('end_time')),
+    creditType: String(pick('credit_type') ?? ''),
+    amount: toBigIntString(toBigint(pick('amount'))),
+  };
+}
+
+function toCamelCase(key: string): string {
+  return key.replace(/_([a-z])/g, (_, ch: string) => ch.toUpperCase());
+}
+
+/** Coerce an SCVal amount field into a bigint for string serialization. */
+function toBigint(value: unknown): bigint {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') return BigInt(Math.trunc(value));
+  if (typeof value === 'string') {
+    try {
+      return BigInt(value);
+    } catch {
+      return 0n;
+    }
+  }
+  return 0n;
 }

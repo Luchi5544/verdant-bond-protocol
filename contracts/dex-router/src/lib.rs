@@ -3,6 +3,11 @@
 use nbbs_shared::DEXError;
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Vec};
 
+/// Issue #188: versioned-interface convention. Bump on a breaking storage
+/// layout or interface change; see docs/upgrade-migrations.md.
+pub const SCHEMA_VERSION: u32 = 1;
+
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -168,8 +173,20 @@ impl DEXRouter {
             .set(&DataKey::CouponEngineAddress, &coupon_engine_address);
     }
 
-    pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), DEXError> {
+    pub fn set_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+        nonce: u64,
+    ) -> Result<(), DEXError> {
         current_admin.require_auth();
+
+        let expected_nonce = get_nonce(&env, &current_admin);
+        if nonce != expected_nonce {
+            return Err(DEXError::InvalidNonce);
+        }
+        set_nonce(&env, &current_admin, expected_nonce + 1);
+
         require_admin(&env, &current_admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(
@@ -184,6 +201,19 @@ impl DEXRouter {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(DEXError::NotInitialized)
+    }
+
+    /// Issue #188: versioned-interface convention — bump when the contract's
+    /// storage layout or callable interface changes in a breaking way. See
+    /// docs/upgrade-migrations.md.
+    pub fn schema_version(env: Env) -> u32 {
+        let _ = env;
+        SCHEMA_VERSION
+    }
+
+
+    pub fn get_nonce(env: Env, address: Address) -> u64 {
+        get_nonce(&env, &address)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -309,9 +339,7 @@ impl DEXRouter {
 
         // Release escrowed tokens when order is cancelled
         let seller_escrow = get_bond_escrow(&env, order.bond_id, &order.seller);
-        let new_escrow = seller_escrow
-            .checked_sub(order.amount)
-            .unwrap_or(0);
+        let new_escrow = seller_escrow.checked_sub(order.amount).unwrap_or(0);
         set_bond_escrow(&env, order.bond_id, &order.seller, new_escrow);
 
         order.status = OrderStatus::Cancelled;
@@ -397,6 +425,29 @@ impl DEXRouter {
             .ok_or(DEXError::Overflow)?;
         set_balance(&env, &order.seller, &order.quote_asset, new_seller_balance);
 
+        // #191: checks-effects-interactions — every piece of local state a
+        // reentrant call into this contract could read (escrow, order
+        // status/remaining amount) must be finalized *before* the external
+        // invoke_contract calls below. bond_issuer.transfer() is an
+        // arbitrary cross-contract call from this contract's perspective;
+        // if it (directly or via a further hop) re-entered execute_purchase
+        // for the same order_id while escrow/order.amount still reflected
+        // the pre-fill state, the same escrowed bond tokens could be sold
+        // more than once before this call's own writes ever landed.
+        let new_seller_escrow = seller_escrow - amount;
+        set_bond_escrow(&env, order.bond_id, &order.seller, new_seller_escrow);
+
+        if amount == order.amount {
+            order.status = OrderStatus::Filled;
+        } else {
+            order.status = OrderStatus::PartiallyFilled;
+            order.amount -= amount;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Order(order_id), &order);
+
         let bond_issuer: Address = env
             .storage()
             .instance()
@@ -420,21 +471,6 @@ impl DEXRouter {
                 seller_bond_nonce.into_val(&env),
             ],
         );
-
-        // Release escrowed tokens on successful fill
-        let new_seller_escrow = seller_escrow - amount;
-        set_bond_escrow(&env, order.bond_id, &order.seller, new_seller_escrow);
-
-        if amount == order.amount {
-            order.status = OrderStatus::Filled;
-        } else {
-            order.status = OrderStatus::PartiallyFilled;
-            order.amount -= amount;
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Order(order_id), &order);
 
         env.events().publish(
             (Symbol::new(&env, "order_filled"),),
@@ -644,37 +680,6 @@ impl DEXRouter {
         );
 
         Ok(result)
-    }
-
-    pub fn set_admin(
-        env: Env,
-        current_admin: Address,
-        new_admin: Address,
-        nonce: u64,
-    ) -> Result<(), DEXError> {
-        current_admin.require_auth();
-
-        let expected_nonce = get_nonce(&env, &current_admin);
-        if nonce != expected_nonce {
-            return Err(DEXError::InvalidNonce);
-        }
-        set_nonce(&env, &current_admin, expected_nonce + 1);
-
-        require_admin(&env, &current_admin)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish(
-            (Symbol::new(&env, "admin_changed"),),
-            (current_admin, new_admin),
-        );
-
-        Ok(())
-    }
-
-    pub fn get_admin(env: Env) -> Result<Address, DEXError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(DEXError::NotInitialized)
     }
 }
 
@@ -1351,8 +1356,11 @@ mod test {
         // Enough balance for many small listings from one seller.
         let order_count: u64 = 40;
         let per_order = 10i128;
-        let (_issuer_admin, issuer_id, bond_id, seller) =
-            setup_bond_and_holder(&env, order_count as i128 * per_order, order_count as i128 * per_order);
+        let (_issuer_admin, issuer_id, bond_id, seller) = setup_bond_and_holder(
+            &env,
+            order_count as i128 * per_order,
+            order_count as i128 * per_order,
+        );
 
         let contract_id = env.register(
             DEXRouter,
@@ -1362,7 +1370,6 @@ mod test {
 
         env.ledger().set_timestamp(1_000_000);
 
-        let mut seller_nonce = 0u64;
         let mut expected_expired = 0u32;
 
         for i in 0..order_count {
@@ -1375,9 +1382,8 @@ mod test {
                 &100i128,
                 &Symbol::new(&env, "USDC"),
                 &ttl,
-                &seller_nonce,
+                &i,
             );
-            seller_nonce += 1;
             if i % 2 == 0 {
                 expected_expired += 1;
             }
@@ -1392,8 +1398,7 @@ mod test {
         let mut passes = 0u32;
 
         loop {
-            let result =
-                client.clean_expired_orders(&admin, &start_id, &batch_size, &admin_nonce);
+            let result = client.clean_expired_orders(&admin, &start_id, &batch_size, &admin_nonce);
             admin_nonce += 1;
             total_cleaned += result.cleaned;
             passes += 1;
@@ -1436,7 +1441,11 @@ mod test {
         let admin = Address::generate(&env);
         let contract_id = env.register(
             DEXRouter,
-            (admin.clone(), Address::generate(&env), Address::generate(&env)),
+            (
+                admin.clone(),
+                Address::generate(&env),
+                Address::generate(&env),
+            ),
         );
         let client = DEXRouterClient::new(&env, &contract_id);
 
@@ -1597,6 +1606,194 @@ mod test {
 
         let result = client.try_execute_purchase(&buyer, &order_id, &100i128, &500i128, &0);
         assert_eq!(result, Err(Ok(DEXError::OrderExpired)));
+    }
+
+    // --- Order replay / stale-state hardening (#215) ---
+    //
+    // Cross-network and cross-contract replay are enforced by the Soroban host's
+    // native-auth preimage (network id + target contract + args), which
+    // `mock_all_auths` bypasses, so they are documented in
+    // docs/security/order-signing-replay-protection.md rather than exercised
+    // here. These tests cover the contract-level guards: fully-filled replay,
+    // partial-fill over-fill, remaining-amount accounting, and the explicit
+    // per-account nonce.
+
+    #[test]
+    fn test_filled_order_cannot_be_repurchased() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &1_000_000i128, &0);
+
+        // Fully fill the order.
+        client.execute_purchase(&buyer, &order_id, &100i128, &1_000i128, &1);
+        assert_eq!(client.get_order(&order_id).status, OrderStatus::Filled);
+
+        // Replaying the (now Filled) order must be rejected, even for 1 unit.
+        let replay = client.try_execute_purchase(&buyer, &order_id, &100i128, &1i128, &2);
+        assert_eq!(replay, Err(Ok(DEXError::OrderAlreadyFilled)));
+    }
+
+    #[test]
+    fn test_partial_order_cannot_be_overfilled() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &1_000_000i128, &0);
+
+        // Fill 400 of 1000; remaining must be tracked on-chain as 600.
+        client.execute_purchase(&buyer, &order_id, &100i128, &400i128, &1);
+        let order = client.get_order(&order_id);
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.amount, 600);
+
+        // Attempting to buy 601 (more than the remaining 600) must be rejected.
+        let overfill = client.try_execute_purchase(&buyer, &order_id, &100i128, &601i128, &2);
+        assert_eq!(overfill, Err(Ok(DEXError::InsufficientBalance)));
+    }
+
+    #[test]
+    fn test_partial_fills_decrement_remaining_to_filled() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &1_000_000i128, &0);
+
+        client.execute_purchase(&buyer, &order_id, &100i128, &600i128, &1);
+        assert_eq!(client.get_order(&order_id).amount, 400);
+
+        client.execute_purchase(&buyer, &order_id, &100i128, &400i128, &2);
+        assert_eq!(client.get_order(&order_id).status, OrderStatus::Filled);
+
+        // No units remain to replay.
+        let replay = client.try_execute_purchase(&buyer, &order_id, &100i128, &1i128, &3);
+        assert_eq!(replay, Err(Ok(DEXError::OrderAlreadyFilled)));
+    }
+
+    #[test]
+    fn test_stale_nonce_replay_rejected() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let (_issuer_admin, issuer_id, _bond_id, _seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let usdc = Symbol::new(&env, "USDC");
+        assert_eq!(client.get_nonce(&user), 0);
+        client.deposit_quote(&user, &usdc, &100i128, &0);
+        assert_eq!(client.get_nonce(&user), 1);
+
+        // Replaying nonce 0 (already consumed) is rejected.
+        let replay = client.try_deposit_quote(&user, &usdc, &100i128, &0);
+        assert_eq!(replay, Err(Ok(DEXError::InvalidNonce)));
+
+        // A skipped/future nonce is also rejected — nonces are strictly sequential.
+        let skipped = client.try_deposit_quote(&user, &usdc, &100i128, &5);
+        assert_eq!(skipped, Err(Ok(DEXError::InvalidNonce)));
+    }
+
+    #[test]
+    fn test_nonce_is_per_account_and_monotonic() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        // One shared, strictly-increasing nonce across all of an account's
+        // actions: listing consumes nonce 0, so a cancel replaying nonce 0 fails.
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        assert_eq!(client.get_nonce(&seller), 1);
+
+        let stale = client.try_cancel_listing(&seller, &order_id, &0);
+        assert_eq!(stale, Err(Ok(DEXError::InvalidNonce)));
+
+        // The correct next nonce succeeds.
+        client.cancel_listing(&seller, &order_id, &1);
+        assert_eq!(client.get_order(&order_id).status, OrderStatus::Cancelled);
     }
 
     mod property {

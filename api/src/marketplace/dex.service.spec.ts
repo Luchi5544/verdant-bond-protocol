@@ -8,6 +8,7 @@ import { NonceService } from '../common/services/nonce.service';
 import { RedisService } from '../common/services/redis.service';
 import { SigningKeyProvider } from '../common/services/signing-key.provider';
 import { ConfigService } from '../config/config.service';
+import { FeatureFlagsService } from '../config/feature-flags.service';
 import { OrderStatus } from './interfaces/marketplace.interface';
 
 const configServiceStub = { getDexRouterAddress: () => 'CDEXROUTERADDRESSPLACEHOLDER' };
@@ -33,6 +34,10 @@ class InMemoryRedis {
     this.store.set(key, value);
   }
 
+  async cacheSet(key: string, _ttl: number, value: string, _tags?: string[]): Promise<void> {
+    this.store.set(key, value);
+  }
+
   async del(key: string): Promise<void> {
     this.store.delete(key);
   }
@@ -51,6 +56,7 @@ class InMemoryRedis {
   async sMembers(_key: string): Promise<string[]> {
     return [];
   }
+  async invalidateTag(_tag: string): Promise<void> {}
 
   keys(): string[] {
     return [...this.store.keys()];
@@ -67,7 +73,7 @@ class InMemoryRedis {
 describe('DexService', () => {
   let service: DexService;
   let contractService: { simulateCall: jest.Mock; invokeContractMethod: jest.Mock };
-  let redis: { get: jest.Mock; setEx: jest.Mock; del: jest.Mock; delPattern: jest.Mock };
+  let redis: { get: jest.Mock; setEx: jest.Mock; del: jest.Mock; cacheSet: jest.Mock; invalidateTag: jest.Mock; delPattern: jest.Mock };
 
   const simulateCallMock = jest.fn();
   const invokeContractMethodMock = jest.fn();
@@ -81,6 +87,8 @@ describe('DexService', () => {
       get: jest.fn().mockResolvedValue(null),
       setEx: jest.fn().mockResolvedValue(undefined),
       del: jest.fn().mockResolvedValue(undefined),
+      cacheSet: jest.fn().mockResolvedValue(undefined),
+      invalidateTag: jest.fn().mockResolvedValue(undefined),
       delPattern: jest.fn().mockResolvedValue(undefined),
     };
 
@@ -106,6 +114,7 @@ describe('DexService', () => {
           useValue: { adminSecret: jest.fn().mockReturnValue('SADMIN') },
         },
         { provide: ConfigService, useValue: configServiceStub },
+        { provide: FeatureFlagsService, useValue: { isEnabled: jest.fn().mockResolvedValue(true) } },
       ],
     }).compile();
 
@@ -152,6 +161,29 @@ describe('DexService', () => {
         expect.objectContaining({ method: 'order_count' }),
       );
     });
+
+    it('filters orders by status explicitly', async () => {
+      simulateCallMock.mockImplementation(({ method, args }: { method: string; args: any[] }) => {
+        if (method === 'order_count') {
+          return Promise.resolve(nativeToScVal(BigInt(4), { type: 'u64' }));
+        }
+        const id = Number(scValToNative(args[0]));
+        // Make id 2 be Expired by setting expiresAt in the past
+        const pastExpiry = BigInt(Math.floor(Date.now() / 1000) - 100);
+        if (id === 2) {
+          const raw = rawOrder(id);
+          // Set expiry at index 8
+          (raw.value() as xdr.ScVal[])[8] = nativeToScVal(pastExpiry, { type: 'u64' });
+          return Promise.resolve(raw);
+        }
+        return Promise.resolve(rawOrder(id));
+      });
+
+      const result = await service.listOrders(undefined, 'Expired', 1, 10);
+
+      expect(result.data.map((order) => order.id)).toEqual([2]);
+      expect(result.meta.total).toBe(1);
+    });
   });
 
   describe('decodeOrder', () => {
@@ -165,7 +197,7 @@ describe('DexService', () => {
         BigInt(1000),
         BigInt(25),
         'USDC',
-        0,
+         0,
         BigInt(1700000000),
         FUTURE_EXPIRY,
       ];
@@ -179,6 +211,7 @@ describe('DexService', () => {
         quoteAsset: 'USDC',
         status: OrderStatus.Open,
         createdAt: new Date(1700000000 * 1000).toISOString(),
+        expiresAt: new Date(Number(FUTURE_EXPIRY) * 1000).toISOString(),
       });
     });
 
@@ -246,7 +279,7 @@ describe('DexService', () => {
         'deposit_quote',
         expect.any(String),
         expect.any(Array),
-        0,
+        address,
       );
     });
   });
@@ -274,7 +307,7 @@ describe('DexService', () => {
         'withdraw_quote',
         expect.any(String),
         expect.any(Array),
-        0,
+        address,
       );
     });
   });
@@ -301,7 +334,7 @@ describe('DexService', () => {
         'clean_expired_orders',
         'SADMIN',
         expect.any(Array),
-        0,
+        'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
       );
       const args = invokeContractMethodMock.mock.calls[0][3];
       expect(Number(scValToNative(args[1]))).toBe(1);
@@ -356,10 +389,11 @@ describe('DexService', () => {
       });
       invokeContractMethodMock.mockResolvedValue({ transactionHash: 'tx-buy', successful: true });
 
-      await service.buyBondTokens({ orderId: 3, amount: 10, maxPrice: 10 } as any, SELLER);
+      const order = await service.buyBondTokens({ orderId: 3, amount: 10, maxPrice: 10 } as any, SELLER);
 
       expect(redis.delPattern).toHaveBeenCalledWith('orders:*');
       expect(redis.del).toHaveBeenCalledWith('order:3');
+      expect(order.transactionHash).toBe('tx-buy');
     });
 
     it('cancelOrder calls delPattern("orders:*") and del("order:<id>")', async () => {
@@ -460,6 +494,30 @@ describe('DexService', () => {
       await expect(service.cancelOrder(9, SELLER)).rejects.toMatchObject({ status: 409 });
     });
 
+    it('rejects a stale price before invoking the purchase contract', async () => {
+      simulateCallMock.mockImplementation(({ method, args }: { method: string; args: any[] }) =>
+        method === 'get_order'
+          ? Promise.resolve(buildOrderScVal({ id: Number(scValToNative(args[0])), statusIndex: 0, expiresAt: FUTURE_EXPIRY }))
+          : Promise.reject(new Error(`unexpected: ${method}`)),
+      );
+
+      await expect(service.buyBondTokens({ orderId: 10, amount: 10, maxPrice: 9 } as any, BUYER))
+        .rejects.toMatchObject({ status: 409 });
+      expect(invokeContractMethodMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a partial-depth change before invoking the purchase contract', async () => {
+      simulateCallMock.mockImplementation(({ method, args }: { method: string; args: any[] }) =>
+        method === 'get_order'
+          ? Promise.resolve(buildOrderScVal({ id: Number(scValToNative(args[0])), statusIndex: 1, expiresAt: FUTURE_EXPIRY }))
+          : Promise.reject(new Error(`unexpected: ${method}`)),
+      );
+
+      await expect(service.buyBondTokens({ orderId: 11, amount: 101, maxPrice: 10 } as any, BUYER))
+        .rejects.toMatchObject({ status: 409 });
+      expect(invokeContractMethodMock).not.toHaveBeenCalled();
+    });
+
     it('decodeOrder reports Expired once the wall clock passes expires_at, even though the raw status index is still Open', () => {
       const pastExpiry = BigInt(Math.floor(Date.now() / 1000) - 1);
       const raw = [BigInt(10), SELLER, BigInt(1), BigInt(100), BigInt(10), 'USDC', 0, BigInt(1700000000), pastExpiry];
@@ -478,7 +536,7 @@ describe('DexService', () => {
 
 describe('DexService — mapDexError (unit)', () => {
   it('maps InsufficientFunds contract error to PAYMENT_REQUIRED HttpException', () => {
-    const svc = new DexService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any);
+    const svc = new DexService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any, {} as any);
     const err = new ContractException('DEX_INSUFFICIENT_FUNDS', 'insufficient', undefined, undefined, 10);
     const mapped = (svc as any).mapDexError(err);
     expect(mapped).toBeInstanceOf(Object);
@@ -488,7 +546,7 @@ describe('DexService — mapDexError (unit)', () => {
   });
 
   it('falls back to BadRequestException for unknown contract codes', () => {
-    const svc = new DexService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any);
+    const svc = new DexService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any, {} as any);
     const err = new ContractException('SOME_CODE', 'some detail', undefined, undefined, 999);
     const mapped = (svc as any).mapDexError(err);
     expect(mapped).toBeInstanceOf(Object);
@@ -542,6 +600,7 @@ describe('DexService — cache staleness (in-memory Redis)', () => {
           useValue: { adminSecret: jest.fn().mockReturnValue('SADMIN') },
         },
         { provide: ConfigService, useValue: configServiceStub },
+        { provide: FeatureFlagsService, useValue: { isEnabled: jest.fn().mockResolvedValue(true) } },
       ],
     }).compile();
 

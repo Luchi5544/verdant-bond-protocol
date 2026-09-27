@@ -14,6 +14,10 @@ import {
   SlashRecord,
   ChallengeRecord,
   ReportStatus,
+  ChallengeStateResponse,
+  ChallengedReportSummary,
+  CouponEligibility,
+  SlashPreview,
 } from './interfaces/oracle.interface';
 import { RedisService } from '../common/services/redis.service';
 import { SigningKeyProvider } from '../common/services/signing-key.provider';
@@ -21,6 +25,7 @@ import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk
 import { StellarService } from '../stellar/stellar.service';
 import { toBigIntString, encodeCid } from '../common/utils';
 import { ConfigService } from '../config/config.service';
+import { verifyManifest, verifyManifestMatchesReport } from './manifest-verification';
 
 
 
@@ -48,6 +53,27 @@ export class OracleService {
   ) {}
 
 async submitReport(dto: SubmitReportDto, providerAddress: string): Promise<ReportResponse> {
+    if (dto.manifest) {
+      const verification = verifyManifest(dto.manifest);
+      if (!verification.valid) {
+        throw new UnprocessableEntityException(
+          `Manifest verification failed: ${verification.error}`,
+        );
+      }
+      const matchVerification = verifyManifestMatchesReport(dto.manifest as any, {
+        project_id: dto.projectId,
+        methodology: dto.methodology,
+        period_start: dto.periodStart,
+        period_end: dto.periodEnd,
+        carbon_sequestered: dto.carbonSequestered,
+      });
+      if (!matchVerification.valid) {
+        throw new BadRequestException(
+          `Manifest values do not match report submission: ${matchVerification.error}`,
+        );
+      }
+    }
+
     const ipfsResult = await this.ipfsService.uploadJson({
       projectId: dto.projectId,
       periodStart: dto.periodStart,
@@ -72,7 +98,6 @@ async submitReport(dto: SubmitReportDto, providerAddress: string): Promise<Repor
     }
 
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getOracleConsumerAddress(), providerAddress);
 
     const { result } = await this.contractService.invokeContractMethod(
       this.configService.getOracleConsumerAddress(), 'submit_report', adminSecret,
@@ -85,7 +110,7 @@ async submitReport(dto: SubmitReportDto, providerAddress: string): Promise<Repor
         nativeToScVal(dto.methodology, { type: 'symbol' }),
         this.evidenceHashToScVal(evidenceReference),
       ],
-      nonce,
+      providerAddress,
     );
 
     const reportId = Number(scValToNative(result));
@@ -134,9 +159,103 @@ async submitReport(dto: SubmitReportDto, providerAddress: string): Promise<Repor
     return reports;
   }
 
+  /** Fetches a single report by id directly from the ledger. */
+  async getReport(reportId: number): Promise<ReportResponse> {
+    const reportScVal = await this.contractService.simulateCall({
+      contractAddress: this.configService.getOracleConsumerAddress(),
+      method: 'get_report',
+      args: [nativeToScVal(BigInt(reportId), { type: 'u64' })],
+    });
+    return this.decodeReport(scValToNative(reportScVal) as any[]);
+  }
+
+  /**
+   * Challenge review surface (#oracle-challenge): returns the report's status
+   * plus every on-chain challenge record against it (counter-evidence hash,
+   * challenger, submitted time, resolution). The report's provider address links
+   * the report to its challenge history.
+   */
+  async getReportChallengeState(reportId: number): Promise<ChallengeStateResponse> {
+    const report = await this.getReport(reportId);
+    const challenges = (await this.getChallengeHistory(report.providerAddress)).filter(
+      (c) => c.reportId === reportId,
+    );
+    return {
+      reportId,
+      status: report.status,
+      challenged: report.status === ReportStatus.Challenged,
+      challenges,
+    };
+  }
+
+  /** Lists every challenged report for a project, each with its latest challenge record. */
+  async getProjectChallengedReports(projectId: string): Promise<ChallengedReportSummary[]> {
+    const reports = await this.getProjectReports(projectId);
+    const challenged = reports.filter((r) => r.status === ReportStatus.Challenged);
+    return Promise.all(
+      challenged.map(async (report) => {
+        const challenges = (await this.getChallengeHistory(report.providerAddress)).filter(
+          (c) => c.reportId === report.id,
+        );
+        return { report, challenge: challenges[0] ?? null };
+      }),
+    );
+  }
+
+  /**
+   * Coupon-distribution eligibility for a project (#oracle-challenge). A project
+   * is eligible only when it has at least one Verified report and no report is
+   * currently Challenged or Rejected. Distributing a coupon on disputed/rejected
+   * data must be blocked.
+   */
+  async getCouponEligibility(projectId: string): Promise<CouponEligibility> {
+    const reports = await this.getProjectReports(projectId);
+    const reasons: string[] = [];
+    const blockedByReportIds: number[] = [];
+
+    const hasVerified = reports.some((r) => r.status === ReportStatus.Verified);
+    const blocking = reports.filter(
+      (r) => r.status === ReportStatus.Challenged || r.status === ReportStatus.Rejected,
+    );
+    const conflictingIds = new Set<number>();
+    for (let i = 0; i < reports.length; i += 1) {
+      for (let j = i + 1; j < reports.length; j += 1) {
+        const left = reports[i];
+        const right = reports[j];
+        if (left.providerAddress === right.providerAddress
+          && left.methodology === right.methodology
+          && left.periodStart < right.periodEnd
+          && right.periodStart < left.periodEnd) {
+          conflictingIds.add(left.id);
+          conflictingIds.add(right.id);
+        }
+      }
+    }
+
+    if (!hasVerified) {
+      reasons.push('No verified oracle report exists for this project');
+    }
+    if (blocking.length > 0) {
+      reasons.push(
+        `${blocking.length} report(s) are challenged or rejected and must be resolved first`,
+      );
+      blockedByReportIds.push(...blocking.map((r) => r.id));
+    }
+    if (conflictingIds.size > 0) {
+      reasons.push('Overlapping oracle report periods must be resolved before coupon distribution');
+      blockedByReportIds.push(...conflictingIds);
+    }
+
+    const eligible = hasVerified && blocking.length === 0 && conflictingIds.size === 0;
+    if (!eligible && reasons.length === 0) {
+      reasons.push('Coupon distribution is not eligible for this project');
+    }
+
+    return { projectId, eligible, reasons, blockedByReportIds };
+  }
+
 async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: string): Promise<ChallengeResponse> {
     const adminSecret = this.getAdminSecret();
-    const nonce = await this.nonceService.next(this.configService.getOracleConsumerAddress(), challengerAddress);
 
     await this.contractService.invokeContractMethod(
       this.configService.getOracleConsumerAddress(), 'challenge_report', adminSecret,
@@ -145,7 +264,7 @@ async challengeReport(reportId: number, dto: ChallengeDto, challengerAddress: st
         nativeToScVal(BigInt(reportId), { type: 'u64' }),
         this.toBytes32(dto.counterEvidenceHash),
       ],
-      nonce,
+      challengerAddress,
     );
 
     await this.redis.del(`oracle:providers`);
@@ -188,7 +307,6 @@ async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
 
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
-    const nonce = await this.nonceService.next(this.configService.getOracleConsumerAddress(), adminAddress);
 
     await this.contractService.invokeContractMethod(
       this.configService.getOracleConsumerAddress(), 'register_provider', adminSecret,
@@ -197,7 +315,7 @@ async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
         Address.fromString(dto.providerAddress).toScVal(),
         nativeToScVal(methodology, { type: 'symbol' }),
       ],
-      nonce,
+      adminAddress,
     );
 
     await this.redis.del(`oracle:providers`);
@@ -320,6 +438,23 @@ async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
     );
   }
 
+  async getSlashPreview(providerAddress: string, reportId: number): Promise<SlashPreview> {
+    const scVal = await this.contractService.simulateCall({
+      contractAddress: this.configService.getOracleConsumerAddress(),
+      method: 'preview_slash',
+      args: [Address.fromString(providerAddress).toScVal(), nativeToScVal(BigInt(reportId), { type: 'u64' })],
+    });
+    const data = scValToNative(scVal) as any[];
+    return {
+      reportId: Number(data[0]),
+      providerAddress: data[1] as string,
+      currentStake: toBigIntString(data[2]),
+      penalty: toBigIntString(data[3]),
+      remainingStake: toBigIntString(data[4]),
+      activeAfter: data[5] as boolean,
+    };
+  }
+
   async getChallengeHistory(providerAddress: string): Promise<ChallengeRecord[]> {
     const scVal = await this.contractService.simulateCall({
       contractAddress: this.configService.getOracleConsumerAddress(),
@@ -374,21 +509,25 @@ async registerProvider(dto: RegisterProviderDto): Promise<ProviderResponse> {
     return undefined;
   }
 
-  private decodeReport(data: any[]): ReportResponse {
+  private decodeReport(data: any): ReportResponse {
+    const verifiedAtNum = Number(this.field(data, 'verified_at', 10));
+    const stake = this.field(data, 'provider_stake_at_verification', 11);
+    
     return {
-      id: Number(data[0]),
-      providerAddress: data[1] as string,
-      projectId: Buffer.from(data[2] as Uint8Array).toString('hex'),
-      periodStart: Number(data[3]),
-      periodEnd: Number(data[4]),
-      carbonSequestered: toBigIntString(data[5]),
-      methodology: data[6] as string,
-      ipfsHash: Buffer.from(data[7] as Uint8Array).toString('hex'),
-      status: this.reportStatusFromIndex(Number(data[8])),
-      createdAt: new Date(Number(data[9]) * 1000).toISOString(),
-      verifiedAt: Number(data[10]) > 0
-        ? new Date(Number(data[10]) * 1000).toISOString()
+      id: Number(this.field(data, 'id', 0)),
+      providerAddress: this.field(data, 'provider', 1) as string,
+      projectId: Buffer.from(this.field(data, 'project_id', 2) as Uint8Array).toString('hex'),
+      periodStart: Number(this.field(data, 'period_start', 3)),
+      periodEnd: Number(this.field(data, 'period_end', 4)),
+      carbonSequestered: toBigIntString(this.field(data, 'carbon_sequestered', 5)),
+      methodology: this.field(data, 'methodology', 6) as string,
+      ipfsHash: Buffer.from(this.field(data, 'ipfs_evidence_hash', 7) as Uint8Array).toString('hex'),
+      status: this.reportStatusFromIndex(Number(this.field(data, 'status', 8))),
+      createdAt: new Date(Number(this.field(data, 'submitted_at', 9)) * 1000).toISOString(),
+      verifiedAt: verifiedAtNum > 0
+        ? new Date(verifiedAtNum * 1000).toISOString()
         : undefined,
+      providerStakeAtVerification: stake != null ? toBigIntString(stake) : undefined,
     };
   }
 

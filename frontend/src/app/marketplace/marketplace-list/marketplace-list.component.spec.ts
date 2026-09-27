@@ -7,6 +7,7 @@ import { MarketplaceListComponent, ORDERS_RETRY_BASE_DELAY_MS, ORDERS_POLL_INTER
 import { ApiService } from '../../shared/services/api.service';
 import { AuthService } from '../../auth/auth.service';
 import { WalletService } from '../../auth/wallet.service';
+import { PendingTransactionsService } from '../../shared/services/pending-transactions.service';
 import { Order, PaginatedResponse } from '../../shared/interfaces/bond.interface';
 
 const ORDER: Order = {
@@ -30,6 +31,7 @@ describe('MarketplaceListComponent', () => {
   let apiService: {
     getBonds: jasmine.Spy;
     getOrders: jasmine.Spy;
+    getOrder: jasmine.Spy;
     buyBondTokens: jasmine.Spy;
     cancelOrder: jasmine.Spy;
     getQuoteBalance: jasmine.Spy;
@@ -39,11 +41,13 @@ describe('MarketplaceListComponent', () => {
     isConnected: ReturnType<typeof signal<boolean>>;
     address: ReturnType<typeof signal<string | null>>;
   };
+  let sessionReady: ReturnType<typeof signal<boolean>>;
 
   beforeEach(async () => {
     apiService = {
       getBonds: jasmine.createSpy('getBonds').and.returnValue(of({ data: [], meta: { page: 1, limit: 100, total: 0, totalPages: 1 } })),
       getOrders: jasmine.createSpy('getOrders').and.returnValue(of({ data: [ORDER], meta: { page: 1, limit: 20, total: 1, totalPages: 1 } })),
+      getOrder: jasmine.createSpy('getOrder').and.returnValue(of(ORDER)),
       buyBondTokens: jasmine.createSpy('buyBondTokens').and.returnValue(of(undefined)),
       cancelOrder: jasmine.createSpy('cancelOrder').and.returnValue(of(undefined)),
       getQuoteBalance: jasmine
@@ -62,14 +66,16 @@ describe('MarketplaceListComponent', () => {
       isConnected: signal(true),
       address: signal('GALICE'),
     };
+    sessionReady = signal(true); // existing tests expect an authenticated session, matching prior behavior
 
     await TestBed.configureTestingModule({
       imports: [MarketplaceListComponent],
       providers: [
         provideRouter([]),
         { provide: ApiService, useValue: apiService },
-        { provide: AuthService, useValue: { token: signal(null) } },
+        { provide: AuthService, useValue: { token: signal(null), sessionReady } },
         { provide: WalletService, useValue: walletService },
+        { provide: PendingTransactionsService, useValue: jasmine.createSpyObj('PendingTransactionsService', ['register']) },
       ],
     }).compileComponents();
   });
@@ -139,6 +145,29 @@ describe('MarketplaceListComponent', () => {
       amount: 5,
       maxPrice: 10,
     });
+  });
+
+  it('revalidates price immediately before submission', () => {
+    apiService.getOrder.and.returnValue(of({ ...ORDER, pricePerToken: '11' }));
+    component.openBuy(ORDER);
+    component.buyAmount = 5;
+    component.buyMaxPrice = 10;
+    component.onBuy(ORDER);
+
+    expect(apiService.getOrder).toHaveBeenCalledWith(1);
+    expect(apiService.buyBondTokens).not.toHaveBeenCalled();
+    expect(component.buyError()).toContain('Stale price');
+  });
+
+  it('revalidates remaining depth immediately before submission', () => {
+    apiService.getOrder.and.returnValue(of({ ...ORDER, amount: '4', status: 'PartiallyFilled' }));
+    component.openBuy(ORDER);
+    component.buyAmount = 5;
+    component.buyMaxPrice = 10;
+    component.onBuy(ORDER);
+
+    expect(apiService.buyBondTokens).not.toHaveBeenCalled();
+    expect(component.buyError()).toContain('only 4 tokens remain');
   });
 
   describe('order refresh', () => {

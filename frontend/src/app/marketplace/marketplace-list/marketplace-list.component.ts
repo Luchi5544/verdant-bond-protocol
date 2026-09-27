@@ -10,6 +10,7 @@ import { WalletService } from '../../auth/wallet.service';
 import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
 import { LoadingSpinnerComponent } from '../../shared/components/loading-spinner/loading-spinner.component';
 import { QuoteBalanceComponent, QuoteBalances } from '../../shared/components/quote-balance/quote-balance.component';
+import { ConnectPromptComponent } from '../../shared/components/connect-prompt/connect-prompt.component';
 import { Order, Bond, QuoteAsset, PaginatedResponse } from '../../shared/interfaces/bond.interface';
 import { appErrorMessage, normalizeApiError } from '../../shared/errors/api-error';
 
@@ -24,7 +25,7 @@ export const ORDERS_POLL_INTERVAL_MS = 15000;
 @Component({
   selector: 'app-marketplace-list',
   standalone: true,
-  imports: [CommonModule, RouterModule, FormsModule, StatusBadgeComponent, LoadingSpinnerComponent, QuoteBalanceComponent],
+  imports: [CommonModule, RouterModule, FormsModule, StatusBadgeComponent, LoadingSpinnerComponent, QuoteBalanceComponent, ConnectPromptComponent],
   template: `
     <div class="marketplace-page">
       <div class="page-header">
@@ -33,6 +34,8 @@ export const ORDERS_POLL_INTERVAL_MS = 15000;
           List Tokens for Sale
         </a>
       </div>
+
+      <app-connect-prompt action="Listings are public; buying, selling, and cancelling need a signed-in wallet." />
 
       @if (error()) {
         <div class="error-banner">{{ error() }}</div>
@@ -52,6 +55,17 @@ export const ORDERS_POLL_INTERVAL_MS = 15000;
             @for (bond of bonds(); track bond.id) {
               <option [ngValue]="bond.id">Bond #{{ bond.id }}</option>
             }
+          </select>
+        </label>
+        <label class="filter-label">
+          Status Filter
+          <select class="filter-select" [ngModel]="filterStatus()" (ngModelChange)="onStatusFilterChange($event)">
+            <option value="All">All Statuses</option>
+            <option value="Open">Open</option>
+            <option value="PartiallyFilled">Partially Filled</option>
+            <option value="Filled">Filled</option>
+            <option value="Cancelled">Cancelled</option>
+            <option value="Expired">Expired</option>
           </select>
         </label>
       </div>
@@ -117,6 +131,10 @@ export const ORDERS_POLL_INTERVAL_MS = 15000;
                               <div class="buy-form">
                                 <input type="number" class="buy-input" placeholder="Amount" [(ngModel)]="buyAmount" min="1" />
                                 <input type="number" class="buy-input" placeholder="Max price" [(ngModel)]="buyMaxPrice" min="0.01" />
+                                <div class="quote-summary">
+                                  Current quote: {{ order.pricePerToken }} {{ order.quoteAsset }} / token ·
+                                  max slippage: {{ maxSlippagePercent(order) | number:'1.0-2' }}%
+                                </div>
                                 @if (buyRequirement(order); as req) {
                                   <div class="buy-requirement">
                                     @if (req.sufficient) {
@@ -137,6 +155,9 @@ export const ORDERS_POLL_INTERVAL_MS = 15000;
                                   <button class="btn btn-sm btn-primary" (click)="onBuy(order)" [disabled]="actionPending() || !canConfirm(order)">Confirm</button>
                                   <button class="btn btn-sm btn-outline" (click)="cancelBuy()">Cancel</button>
                                 </div>
+                                @if (!authService.sessionReady()) {
+                                  <span class="auth-hint">Connect your wallet and sign in to buy.</span>
+                                }
                                 @if (buyError()) {
                                   <div class="error-msg">{{ buyError() }}</div>
                                 }
@@ -244,10 +265,12 @@ export const ORDERS_POLL_INTERVAL_MS = 15000;
     .buy-input { padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.8125rem; outline: none; width: 100%; }
     .buy-input:focus { border-color: #3b82f6; }
     .buy-actions { display: flex; gap: 4px; }
+    .quote-summary { color: #4b5563; font-size: 0.75rem; }
     .buy-requirement { display: flex; flex-direction: column; gap: 6px; font-size: 0.75rem; padding: 8px; border-radius: 6px; }
     .sufficient-msg { color: #22c55e; }
     .insufficient-msg { color: #ef4444; }
     .error-msg { font-size: 0.75rem; color: #ef4444; }
+    .auth-hint { font-size: 0.75rem; color: #92400e; background: #fffbeb; padding: 4px 8px; border-radius: 6px; }
   `],
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
@@ -257,12 +280,14 @@ export class MarketplaceListComponent implements OnInit, OnDestroy {
   private readonly router = inject(Router);
   readonly authService = inject(AuthService);
   readonly walletService = inject(WalletService);
+  private readonly pendingTx = inject(PendingTransactionsService);
 
   readonly orders = signal<Order[]>([]);
   readonly bonds = signal<Bond[]>([]);
   readonly loading = signal(true);
   readonly error = signal('');
   readonly filterBondId = signal<number | null>(null);
+  readonly filterStatus = signal<Order['status'] | 'All'>('All');
 
   readonly buyOrderId = signal<number | null>(null);
   readonly buySubmitting = signal(false);
@@ -311,8 +336,16 @@ export class MarketplaceListComponent implements OnInit, OnDestroy {
   readonly priceKeys = computed(() => Object.keys(this.bestPrices()).map(Number));
 
   readonly filteredOrders = computed(() => {
-    const selected = this.filterBondId();
-    return selected ? this.orders().filter(o => o.bondId === selected) : this.orders();
+    const selectedBond = this.filterBondId();
+    const selectedStatus = this.filterStatus();
+    let result = this.orders();
+    if (selectedBond) {
+      result = result.filter(o => o.bondId === selectedBond);
+    }
+    if (selectedStatus !== 'All') {
+      result = result.filter(o => o.status === selectedStatus);
+    }
+    return result;
   });
 
   readonly myOrders = computed(() => {
@@ -325,6 +358,10 @@ export class MarketplaceListComponent implements OnInit, OnDestroy {
     const bondIdParam = this.route.snapshot.queryParamMap.get('bondId');
     if (bondIdParam) {
       this.filterBondId.set(Number(bondIdParam));
+    }
+    const statusParam = this.route.snapshot.queryParamMap.get('status') as Order['status'] | null;
+    if (statusParam) {
+      this.filterStatus.set(statusParam);
     }
     this.ordersRefresh$
       .pipe(
@@ -372,7 +409,7 @@ export class MarketplaceListComponent implements OnInit, OnDestroy {
     this.error.set('');
     // defer re-invokes the API call on every (re)subscription, so retries issue a
     // fresh request with a fresh cache-busting param instead of reusing a stale one.
-    return defer(() => this.apiService.getOrders({ bondId: this.filterBondId() ?? undefined }, forceRefresh)).pipe(
+    return defer(() => this.apiService.getOrders({ bondId: this.filterBondId() ?? undefined, status: this.filterStatus() === 'All' ? undefined : this.filterStatus() }, forceRefresh)).pipe(
       retry({
         count: ORDERS_RETRY_COUNT,
         delay: (error, attempt) =>
@@ -402,7 +439,17 @@ export class MarketplaceListComponent implements OnInit, OnDestroy {
     this.filterBondId.set(bondId);
     this.router.navigate([], {
       relativeTo: this.route,
-      queryParams: bondId ? { bondId } : {},
+      queryParams: bondId ? { bondId } : { bondId: null },
+      queryParamsHandling: 'merge',
+    });
+    this.loadOrders();
+  }
+
+  onStatusFilterChange(status: Order['status'] | 'All'): void {
+    this.filterStatus.set(status);
+    this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: status !== 'All' ? { status } : { status: null },
       queryParamsHandling: 'merge',
     });
     this.loadOrders();
@@ -452,6 +499,13 @@ export class MarketplaceListComponent implements OnInit, OnDestroy {
     return this.buyRequirement(order)?.sufficient ?? false;
   }
 
+  maxSlippagePercent(order: Order): number {
+    const current = Number(order.pricePerToken);
+    return current > 0 && this.buyMaxPrice >= current
+      ? ((this.buyMaxPrice - current) / current) * 100
+      : 0;
+  }
+
   focusQuotePanel(): void {
     document.getElementById('quote-balance')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
@@ -462,11 +516,27 @@ export class MarketplaceListComponent implements OnInit, OnDestroy {
     this.buySubmitting.set(true);
     this.buyError.set('');
 
-    this.apiService.buyBondTokens({
-      orderId: order.id,
-      amount: this.buyAmount,
-      maxPrice: this.buyMaxPrice,
-    }).subscribe({
+    const requestedAmount = this.buyAmount;
+    const approvedMaxPrice = this.buyMaxPrice;
+    this.apiService.getOrder(order.id).pipe(
+      switchMap((current) => {
+        this.orders.update((orders) => orders.map((item) => item.id === current.id ? current : item));
+        if (current.status !== 'Open' && current.status !== 'PartiallyFilled') {
+          throw new Error(`Order is no longer available (${current.status}).`);
+        }
+        if (requestedAmount > Number(current.amount)) {
+          throw new Error(`Stale quote: only ${current.amount} tokens remain.`);
+        }
+        if (Number(current.pricePerToken) > approvedMaxPrice) {
+          throw new Error(`Stale price: current price ${current.pricePerToken} exceeds your maximum ${approvedMaxPrice}.`);
+        }
+        return this.apiService.buyBondTokens({
+          orderId: current.id,
+          amount: requestedAmount,
+          maxPrice: approvedMaxPrice,
+        });
+      }),
+    ).subscribe({
       next: () => {
         this.buyOrderId.set(null);
         this.buySubmitting.set(false);

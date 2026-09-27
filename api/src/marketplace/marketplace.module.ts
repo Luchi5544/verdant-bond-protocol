@@ -3,12 +3,22 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { MarketplaceController } from './marketplace.controller';
 import { DexService } from './dex.service';
 import { DexScheduler } from './dex.scheduler';
+import { DexReconciliationService } from './dex.reconciliation.service';
+import { DexReconciliationScheduler } from './dex.reconciliation.scheduler';
 import { LiquidityService } from './liquidity.service';
+import { OrderStateService } from './order-state.service';
 
 @Module({
   imports: [ScheduleModule.forRoot()],
   controllers: [MarketplaceController],
-  providers: [DexService, LiquidityService, DexScheduler],
-  exports: [DexService, LiquidityService],
+  providers: [
+    DexService,
+    LiquidityService,
+    OrderStateService,
+    DexScheduler,
+    DexReconciliationService,
+    DexReconciliationScheduler,
+  ],
+  exports: [DexService, LiquidityService, DexReconciliationService, OrderStateService],
 })
 export class MarketplaceModule {}

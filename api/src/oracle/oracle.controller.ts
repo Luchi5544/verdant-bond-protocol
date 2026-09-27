@@ -1,6 +1,6 @@
 import {
   Controller, Get, Post, Body, Param, Req,
-  HttpCode, HttpStatus, ParseIntPipe, UseGuards,
+  HttpCode, HttpStatus, ParseIntPipe, UseGuards, Header, Query,
 } from '@nestjs/common';
 import { OracleService } from './oracle.service';
 import { OracleMonitoringService } from './oracle.monitoring.service';
@@ -11,8 +11,11 @@ import { ChallengeDto } from './dto/challenge.dto';
 import { RegisterProviderDto } from './dto/register-provider.dto';
 import { ListOracleIncidentsDto } from './dto/list-oracle-incidents.dto';
 import { ResolveOracleIncidentDto } from './dto/resolve-oracle-incident.dto';
-import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { AdminGuard } from '../common/guards/admin.guard';
+import { PermissionsGuard } from '../common/guards/permissions.guard';
+import { RequirePermissions } from '../common/decorators/permissions.decorator';
+import { Permission } from '../auth/rbac';
+import { RequireQuota } from '../common/decorators/quota.decorator';
+import { QuotaResource } from '../common/services/quota.service';
 import { IntentGuard } from '../common/guards/intent.guard';
 import { RequireIntent } from '../common/decorators/require-intent.decorator';
 import { RateLimit } from '../common/decorators/rate-limit.decorator';
@@ -22,8 +25,13 @@ import {
   ProviderResponse,
   ProviderStatsWithHistory,
   OracleStalenessReport,
+  ChallengeStateResponse,
+  ChallengedReportSummary,
+  CouponEligibility,
+  OracleAnomalyReport,
 } from './interfaces/oracle.interface';
 import { OracleIncident } from './interfaces/oracle-incident.interface';
+import { OracleIncidentRepository } from './oracle-incident.repository';
 import { PaginatedResponse } from '../common/dto/pagination.dto';
 
 @Controller('oracle')
@@ -35,13 +43,13 @@ export class OracleController {
   ) {}
 
   @Post('reports')
-  @UseGuards(JwtAuthGuard, ProviderGuard)
+  @RequireQuota(QuotaResource.SUBMIT_ORACLE_REPORT)
   @HttpCode(HttpStatus.CREATED)
   async submitReport(
     @Body() dto: SubmitReportDto,
     @Req() req: any,
   ): Promise<ReportResponse> {
-    const providerAddress = req.user.walletAddress;
+    const providerAddress = req.headers['x-provider-address'] as string;
     return this.oracleService.submitReport(dto, providerAddress);
   }
 
@@ -52,20 +60,55 @@ export class OracleController {
     return this.oracleService.getProjectReports(projectId);
   }
 
+  /**
+   * Challenge review surface (#oracle-challenge): list every challenged report
+   * for a project, each with its latest challenge record (counter-evidence hash,
+   * challenger, submitted time, resolution).
+   */
+  @Get('reports/:projectId/challenges')
+  async getProjectChallengedReports(
+    @Param('projectId') projectId: string,
+  ): Promise<ChallengedReportSummary[]> {
+    return this.oracleService.getProjectChallengedReports(projectId);
+  }
+
+  /**
+   * Full challenge detail for a single report: current status plus all on-chain
+   * challenge records (counter-evidence hash, challenger, submitted time,
+   * resolution). Resolution history links to coupon-distribution eligibility.
+   */
+  @Get('challenges/:reportId')
+  async getReportChallengeState(
+    @Param('reportId', ParseIntPipe) reportId: number,
+  ): Promise<ChallengeStateResponse> {
+    return this.oracleService.getReportChallengeState(reportId);
+  }
+
+  /**
+   * Coupon-distribution eligibility for a project (#oracle-challenge). Used by
+   * the bond coupon flow to block/warn distribution when a report is challenged.
+   */
+  @Get('projects/:projectId/coupon-eligibility')
+  async getCouponEligibility(
+    @Param('projectId') projectId: string,
+  ): Promise<CouponEligibility> {
+    return this.oracleService.getCouponEligibility(projectId);
+  }
+
   @Post('challenge/:reportId')
-  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   async challengeReport(
     @Param('reportId', ParseIntPipe) reportId: number,
     @Body() dto: ChallengeDto,
     @Req() req: any,
   ): Promise<ChallengeResponse> {
-    const challengerAddress = req.user.walletAddress;
+    const challengerAddress = req.headers['x-wallet-address'] as string;
     return this.oracleService.challengeReport(reportId, dto, challengerAddress);
   }
 
   @Post('providers')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.REGISTER_PROVIDER)
   @RequireIntent('register_provider', 'id', 'global')
   @RateLimit({ type: 'oracle' })
   @HttpCode(HttpStatus.CREATED)
@@ -90,6 +133,12 @@ export class OracleController {
     return this.monitoringService.computeStaleness();
   }
 
+  @Get('monitoring/anomalies')
+  @Header('Cache-Control', 'no-cache')
+  async anomalies(): Promise<OracleAnomalyReport> {
+    return this.monitoringService.computeCrossSourceAnomalies();
+  }
+
   /**
    * Operator-facing incident surface (issue #95). Admin-guarded like the
    * other privileged actions in this API (e.g. `BondsController`'s
@@ -97,15 +146,17 @@ export class OracleController {
    * acknowledgement/resolution is operational state, not public data.
    */
   @Get('incidents')
-  @UseGuards(JwtAuthGuard, AdminGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard)
+  @RequirePermissions(Permission.MANAGE_INCIDENTS)
   async listIncidents(
     @Query() query: ListOracleIncidentsDto,
   ): Promise<PaginatedResponse<OracleIncident>> {
-    return this.incidents.findMany(query.page, query.limit, query.status);
+    return this.incidents.findMany(query.page, query.limit, query.status, query.cursor);
   }
 
   @Post('incidents/:id/acknowledge')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.MANAGE_INCIDENTS)
   @RequireIntent('acknowledge_incident', 'id')
   @HttpCode(HttpStatus.OK)
   async acknowledgeIncident(
@@ -117,7 +168,8 @@ export class OracleController {
   }
 
   @Post('incidents/:id/resolve')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.MANAGE_INCIDENTS)
   @RequireIntent('resolve_incident', 'id')
   @HttpCode(HttpStatus.OK)
   async resolveIncident(

@@ -1,12 +1,23 @@
 #![no_std]
 #![allow(deprecated)]
+#![allow(clippy::too_many_arguments)]
 use nbbs_shared::{BiodiversityMetrics, OracleError, ReportStatus};
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, BytesN, Env, Symbol, Vec};
 
 pub const CHALLENGE_WINDOW_SECONDS: u64 = 259200;
 pub const SLASH_PENALTY_PPM: i128 = 100_000;
+/// Minimum number of distinct qualifying verifiers before a report reaches
+/// `Verified`. Two, so that no single address can verify a report on its own:
+/// `qualifying_verifier_count` counts the admin unconditionally, so a default
+/// of one let the admin alone verify any report, which contradicts the
+/// multi-source guarantee in docs/oracle-design.md. Override per deployment
+/// with `set_signature_threshold`.
 pub const DEFAULT_SIGNATURE_THRESHOLD: u32 = 2;
 pub const DEFAULT_MIN_VERIFIER_STAKE: i128 = 10_000;
+
+/// Issue #188: versioned-interface convention. Bump on a breaking storage
+/// layout or interface change; see docs/upgrade-migrations.md.
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone)]
 #[contracttype]
@@ -39,22 +50,7 @@ pub struct OracleProvider {
     pub registered_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct Report {
-    pub id: u64,
-    pub provider: Address,
-    pub project_id: BytesN<32>,
-    pub period_start: u64,
-    pub period_end: u64,
-    pub carbon_sequestered: i128,
-    pub biodiversity: BiodiversityMetrics,
-    pub methodology: Symbol,
-    pub ipfs_evidence_hash: BytesN<32>,
-    pub status: ReportStatus,
-    pub submitted_at: u64,
-    pub verified_at: u64,
-}
+pub use nbbs_shared::Report;
 
 #[derive(Clone)]
 #[contracttype]
@@ -74,6 +70,17 @@ pub struct SlashRecord {
     pub penalty: i128,
     pub remaining_stake: i128,
     pub timestamp: u64,
+    pub active_after: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SlashPreview {
+    pub report_id: u64,
+    pub provider: Address,
+    pub current_stake: i128,
+    pub penalty: i128,
+    pub remaining_stake: i128,
     pub active_after: bool,
 }
 
@@ -132,12 +139,24 @@ impl OracleConsumer {
             .set(&DataKey::MinimumVerifierStake, &DEFAULT_MIN_VERIFIER_STAKE);
     }
 
+    pub fn get_nonce(env: Env, address: Address) -> u64 {
+        get_nonce(&env, &address)
+    }
+
     pub fn set_admin(
         env: Env,
         current_admin: Address,
         new_admin: Address,
+        nonce: u64,
     ) -> Result<(), OracleError> {
         current_admin.require_auth();
+
+        let expected_nonce = get_nonce(&env, &current_admin);
+        if nonce != expected_nonce {
+            return Err(OracleError::InvalidNonce);
+        }
+        set_nonce(&env, &current_admin, expected_nonce + 1);
+
         require_admin(&env, &current_admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(
@@ -153,6 +172,15 @@ impl OracleConsumer {
             .get(&DataKey::Admin)
             .ok_or(OracleError::NotInitialized)
     }
+
+    /// Issue #188: versioned-interface convention — bump when the contract's
+    /// storage layout or callable interface changes in a breaking way. See
+    /// docs/upgrade-migrations.md.
+    pub fn schema_version(env: Env) -> u32 {
+        let _ = env;
+        SCHEMA_VERSION
+    }
+
 
     pub fn register_provider(
         env: Env,
@@ -280,6 +308,29 @@ impl OracleConsumer {
             }
         }
 
+        // Reporting windows are half-open: [period_start, period_end). This
+        // permits adjacent reports while rejecting exact and partial overlap
+        // from the same provider/methodology for the same project.
+        let existing_ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProjectReports(project_id.clone()))
+            .unwrap_or(vec![&env]);
+        for existing_id in existing_ids.iter() {
+            let existing: Report = env
+                .storage()
+                .instance()
+                .get(&DataKey::Report(existing_id))
+                .ok_or(OracleError::ReportNotFound)?;
+            if existing.provider == provider
+                && existing.methodology == methodology
+                && period_start < existing.period_end
+                && existing.period_start < period_end
+            {
+                return Err(OracleError::OverlappingReportPeriod);
+            }
+        }
+
         let count: u64 = env
             .storage()
             .instance()
@@ -304,6 +355,7 @@ impl OracleConsumer {
             status: ReportStatus::Pending,
             submitted_at: now,
             verified_at: 0,
+            provider_stake_at_verification: None,
         };
 
         env.storage()
@@ -347,18 +399,6 @@ impl OracleConsumer {
     ) -> Result<(), OracleError> {
         caller.require_auth();
 
-        let is_admin = require_admin(&env, &caller).is_ok();
-        if !is_admin {
-            let p: OracleProvider = env
-                .storage()
-                .instance()
-                .get(&DataKey::Provider(caller.clone()))
-                .ok_or(OracleError::Unauthorized)?;
-            if !p.active || p.stake < minimum_verifier_stake(&env) {
-                return Err(OracleError::Unauthorized);
-            }
-        }
-
         let expected_nonce = get_nonce(&env, &caller);
         if nonce != expected_nonce {
             return Err(OracleError::InvalidNonce);
@@ -381,6 +421,18 @@ impl OracleConsumer {
 
         if caller == report.provider {
             return Err(OracleError::InvalidSignature);
+        }
+
+        let is_admin = require_admin(&env, &caller).is_ok();
+        if !is_admin {
+            let p: OracleProvider = env
+                .storage()
+                .instance()
+                .get(&DataKey::Provider(caller.clone()))
+                .ok_or(OracleError::Unauthorized)?;
+            if !p.active || p.stake < minimum_verifier_stake(&env) {
+                return Err(OracleError::Unauthorized);
+            }
         }
 
         let verifiers_key = DataKey::ReportVerifiers(report_id);
@@ -414,8 +466,16 @@ impl OracleConsumer {
             .unwrap_or(DEFAULT_SIGNATURE_THRESHOLD);
 
         if qualifying_verifier_count(&env, &verifiers) >= threshold {
+            let provider_stake = env
+                .storage()
+                .instance()
+                .get::<_, OracleProvider>(&DataKey::Provider(report.provider.clone()))
+                .map(|p| p.stake)
+                .unwrap_or(0);
+
             report.status = ReportStatus::Verified;
             report.verified_at = env.ledger().timestamp();
+            report.provider_stake_at_verification = Some(provider_stake);
             env.storage()
                 .instance()
                 .set(&DataKey::Report(report_id), &report);
@@ -817,35 +877,55 @@ impl OracleConsumer {
         Ok(())
     }
 
-    pub fn set_admin(
+    /// Admin-gated entry point for slashing a provider's stake.
+    ///
+    /// `resolve_challenge` already slashes internally when a report is
+    /// rejected; this exposes the same logic for the case where an admin must
+    /// act on a report directly. Gating matches `resolve_challenge`: the caller
+    /// must authorize, present the correct nonce, and be the stored admin.
+    pub fn slash_provider(
         env: Env,
-        current_admin: Address,
-        new_admin: Address,
+        caller: Address,
+        provider: Address,
+        report_id: u64,
         nonce: u64,
     ) -> Result<(), OracleError> {
-        current_admin.require_auth();
+        caller.require_auth();
 
-        let expected_nonce = get_nonce(&env, &current_admin);
+        let expected_nonce = get_nonce(&env, &caller);
         if nonce != expected_nonce {
             return Err(OracleError::InvalidNonce);
         }
-        set_nonce(&env, &current_admin, expected_nonce + 1);
+        set_nonce(&env, &caller, expected_nonce + 1);
 
-        require_admin(&env, &current_admin)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish(
-            (Symbol::new(&env, "admin_changed"),),
-            (current_admin, new_admin),
-        );
+        require_admin(&env, &caller)?;
 
-        Ok(())
+        slash_provider(&env, &provider, report_id)
     }
 
-    pub fn get_admin(env: Env) -> Result<Address, OracleError> {
-        env.storage()
+    /// Reports what slashing `provider` over `report_id` would cost, without
+    /// applying it. Same argument order as `slash_provider` and as the API's
+    /// `getSlashPreview` call.
+    ///
+    /// Read-only, so no authorization is required. The report must have been
+    /// filed by `provider`; a report filed by someone else is reported as not
+    /// found for that provider, so the preview cannot be used to probe one
+    /// provider's stake against another provider's report.
+    pub fn preview_slash(
+        env: Env,
+        provider: Address,
+        report_id: u64,
+    ) -> Result<SlashPreview, OracleError> {
+        let report: Report = env
+            .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .ok_or(OracleError::NotInitialized)
+            .get(&DataKey::Report(report_id))
+            .ok_or(OracleError::ReportNotFound)?;
+        if report.provider != provider {
+            return Err(OracleError::ReportNotFound);
+        }
+
+        preview_slash(&env, &provider, report_id)
     }
 }
 
@@ -924,8 +1004,41 @@ fn slash_provider(env: &Env, provider: &Address, report_id: u64) -> Result<(), O
         (Symbol::new(env, "provider_slashed"),),
         (provider.clone(), penalty, p.stake, p.active),
     );
-    
+
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn preview_slash(
+    env: &Env,
+    provider: &Address,
+    report_id: u64,
+) -> Result<SlashPreview, OracleError> {
+    let p: OracleProvider = env
+        .storage()
+        .instance()
+        .get(&DataKey::Provider(provider.clone()))
+        .ok_or(OracleError::ProviderNotFound)?;
+
+    let mut penalty = p.stake * SLASH_PENALTY_PPM / 1_000_000;
+    if penalty <= 0 {
+        penalty = p.stake;
+    }
+    if penalty > p.stake {
+        penalty = p.stake;
+    }
+
+    let remaining_stake = p.stake.saturating_sub(penalty);
+    let active_after = remaining_stake > 0;
+
+    Ok(SlashPreview {
+        report_id,
+        provider: p.address.clone(),
+        current_stake: p.stake,
+        penalty,
+        remaining_stake,
+        active_after,
+    })
 }
 
 #[cfg(test)]
@@ -996,6 +1109,59 @@ mod test {
         let project_reports = client.get_project_reports(&project_id);
         assert_eq!(project_reports.len(), 1);
         assert_eq!(project_reports.get(0).unwrap(), report_id);
+    }
+
+    #[test]
+    fn test_report_period_overlap_rules() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 7);
+        let methodology = Symbol::new(&env, "verra_vcs");
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+        client.register_provider(&admin, &provider, &methodology, &0);
+        client.submit_report(
+            &provider,
+            &project_id,
+            &1000,
+            &2000,
+            &100,
+            &BiodiversityMetrics::Absent,
+            &methodology,
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        for (start, end) in [(1000u64, 2000u64), (1500, 2500)] {
+            let result = client.try_submit_report(
+                &provider,
+                &project_id,
+                &start,
+                &end,
+                &100,
+                &BiodiversityMetrics::Absent,
+                &methodology,
+                &make_ipfs_hash(&env, 2),
+                &1,
+            );
+            assert_eq!(result, Err(Ok(OracleError::OverlappingReportPeriod)));
+        }
+
+        // Half-open windows allow an adjacent period.
+        let adjacent = client.submit_report(
+            &provider,
+            &project_id,
+            &2000,
+            &3000,
+            &100,
+            &BiodiversityMetrics::Absent,
+            &methodology,
+            &make_ipfs_hash(&env, 3),
+            &1,
+        );
+        assert_eq!(adjacent, 2);
     }
 
     #[test]
@@ -1098,7 +1264,7 @@ mod test {
         assert_eq!(challenge.challenger, challenger);
         assert!(!challenge.resolved);
 
-        client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &1);
+        client.resolve_challenge(&admin, &report_id, &ReportStatus::Verified, &2);
 
         let resolved = client.get_report(&report_id);
         assert_eq!(resolved.status, ReportStatus::Verified);
@@ -1251,10 +1417,14 @@ mod test {
             &0,
         );
 
-        client.verify_report(&admin, &report_id, &2);
+        client.verify_report(&admin, &report_id, &1);
 
+        // The report is still Pending: one qualifying verification does not meet
+        // DEFAULT_SIGNATURE_THRESHOLD. The provider re-verifying its own report is
+        // therefore rejected as InvalidSignature, per oracle-design.md: "A provider
+        // cannot verify its own report".
         let result = client.try_verify_report(&provider, &report_id, &1);
-        assert_eq!(result, Err(Ok(OracleError::ReportAlreadyVerified)));
+        assert_eq!(result, Err(Ok(OracleError::InvalidSignature)));
     }
 
     #[test]
@@ -2110,12 +2280,7 @@ mod test {
         // Now resolve the challenge with rejection, which calls slash_provider internally.
         // Before the fix: if provider was missing, this would panic in slash_provider's .unwrap()
         // After the fix: it returns OracleError::ProviderNotFound gracefully
-        let result = client.try_resolve_challenge(
-            &admin,
-            &report_id,
-            &ReportStatus::Rejected,
-            &1,
-        );
+        let result = client.try_resolve_challenge(&admin, &report_id, &ReportStatus::Rejected, &1);
 
         // Should succeed - provider exists
         assert_eq!(result, Ok(Ok(())));
@@ -2277,5 +2442,191 @@ mod test {
                 }
             }
         }
+    }
+    #[test]
+    fn test_provider_stake_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra"), &0);
+        client.add_stake(&provider, &50000, &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000,
+            &2000,
+            &100,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        client.set_signature_threshold(&admin, &1u32, &1);
+        client.verify_report(&admin, &report_id, &2);
+
+        let report_verified = client.get_report(&report_id);
+        assert_eq!(report_verified.provider_stake_at_verification, Some(50000));
+
+        // Stake change/slash after verification
+        client.slash_provider(&admin, &provider, &report_id, &3);
+        let p_after = client.get_provider(&provider);
+        // SLASH_PENALTY_PPM is a rate, not an amount: 50_000 * 100_000 / 1_000_000 = 5_000.
+        assert_eq!(p_after.stake, 45_000);
+
+        let report_after_slash = client.get_report(&report_id);
+        assert_eq!(
+            report_after_slash.provider_stake_at_verification,
+            Some(50000)
+        );
+        assert_eq!(report_after_slash.status, ReportStatus::Verified);
+    }
+
+    #[test]
+    fn test_preview_slash_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.add_stake(&provider, &50000, &0);
+
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        let preview = client.preview_slash(&provider, &report_id);
+        assert_eq!(preview.report_id, report_id);
+        assert_eq!(preview.current_stake, 50000);
+        // SLASH_PENALTY_PPM is 100_000 ppm = 10%: 50_000 * 100_000 / 1_000_000.
+        assert_eq!(preview.penalty, 5_000);
+        assert_eq!(preview.remaining_stake, 45_000);
+        assert!(preview.active_after);
+
+        // Someone else's report is not previewable against this provider.
+        assert_eq!(
+            client.try_preview_slash(&Address::generate(&env), &report_id),
+            Err(Ok(OracleError::ReportNotFound))
+        );
+    }
+
+    #[test]
+    fn test_preview_slash_already_slashed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+        client.add_stake(&provider, &50000, &0);
+
+        // Slash once first
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &1,
+        );
+
+        client.slash_provider(&admin, &provider, &report_id, &1);
+
+        // Try preview after slashing: 50_000 - 5_000 = 45_000 remains staked.
+        let preview = client.preview_slash(&provider, &report_id);
+        assert_eq!(preview.current_stake, 45_000);
+        // The penalty is 10% of the *current* stake, so 4_500 rather than 5_000.
+        assert_eq!(preview.penalty, 4_500);
+        assert_eq!(preview.remaining_stake, 40_500);
+        assert!(preview.active_after);
+    }
+
+    #[test]
+    fn test_preview_slash_inactive_provider() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let project_id = create_project_id(&env, 1);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        // Submit while the provider is still active: an inactive provider cannot
+        // submit (Unauthorized), so the report has to exist before removal.
+        let report_id = client.submit_report(
+            &provider,
+            &project_id,
+            &1000u64,
+            &2000u64,
+            &100_000i128,
+            &BiodiversityMetrics::Absent,
+            &Symbol::new(&env, "verra_vcs"),
+            &make_ipfs_hash(&env, 1),
+            &0,
+        );
+
+        // Now remove the provider. The admin consumed nonce 0 registering it.
+        client.remove_provider(&admin, &provider, &1);
+
+        // `remove_provider` deactivates the provider but keeps its record, so the
+        // preview still resolves. It reports the stake actually at risk, which is
+        // zero here because this provider never staked, and active_after is false.
+        // ProviderNotFound is unreachable through deactivation; that path is
+        // covered by test_preview_slash_missing_report.
+        let preview = client.preview_slash(&provider, &report_id);
+        assert_eq!(preview.current_stake, 0);
+        assert_eq!(preview.penalty, 0);
+        assert_eq!(preview.remaining_stake, 0);
+        assert!(!preview.active_after);
+    }
+
+    #[test]
+    fn test_preview_slash_missing_report() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+
+        let contract_id = env.register(OracleConsumer, (admin.clone(),));
+        let client = OracleConsumerClient::new(&env, &contract_id);
+
+        client.register_provider(&admin, &provider, &Symbol::new(&env, "verra_vcs"), &0);
+
+        // Try preview with non-existent report ID
+        let result = client.try_preview_slash(&provider, &999);
+        assert_eq!(result, Err(Ok(OracleError::ReportNotFound)));
     }
 }

@@ -34,6 +34,41 @@ Key invariants:
 }
 ```
 
+## Evidence Manifest Schema (#113)
+
+Oracle adapters produce a canonical signed manifest tying raw observations, methodology, transformations, provider identity, and final submitted values together.
+
+```json
+{
+  "project_id": "VCS-1234",
+  "provider": "SatelliteProcessor",
+  "signer_public_key": "VERDANT_ORACLE_KEY_V1",
+  "methodology": "REMOTE_SENSING",
+  "period_start": "2025-01-01",
+  "period_end": "2025-12-31",
+  "carbon_sequestered": 50000,
+  "confidence": 0.85,
+  "raw_observations": {
+    "scene_ids": ["scene-101", "scene-102"],
+    "sources": ["sentinel-2"],
+    "scene_count": 2
+  },
+  "transformation_parameters": {
+    "bbox": [-62.5, -3.5, -62.0, -3.0],
+    "area_ha": 1000,
+    "baseline_ndvi": 0.45,
+    "max_cloud_cover": 20
+  },
+  "generated_at": "2025-12-31T23:59:59.000Z",
+  "signature": "hmac_sha256_hex_digest_over_canonical_json"
+}
+```
+
+### Verification Rules
+1. **Schema Validation**: Validated via Zod (`EvidenceManifestSchema`).
+2. **Signature Integrity**: HMAC-SHA256 signature generated over canonical (key-sorted) JSON of unsigned fields using provider key/secret. Tampered fields yield invalid signature verification.
+3. **API Matching**: The NestJS API verifies that `project_id`, `methodology`, `period_start`, `period_end`, and `carbon_sequestered` in the manifest match the submitted DTO values exactly before transaction invocation.
+
 ## Evidence Hash Requirements
 
 `ipfs_evidence_hash` (and the API's `SubmitReportDto.evidenceHash`) is a
@@ -149,6 +184,44 @@ These power the API's `GET /oracle/stats/:providerAddress` endpoint and the
 log-based staleness alerting described in
 [`runbook-degraded-providers.md`](./runbook-degraded-providers.md).
 
+## Cross-Source Anomaly Detection (#158)
+
+Independent reports for the same project-period from different providers can be
+compared so a single faulty, manipulated, or mis-entered measurement is not
+accepted at face value. The monitor (and the API) compute a tolerance-based
+cross-source assessment over the verified reports in each project-period:
+
+- **Inputs.** Each `Verified` report contributes `(provider, methodology,
+  carbonSequestered, periodStart, periodEnd)`. Reports are clustered by
+  `projectId + (periodStart, periodEnd)` so each period is assessed separately.
+- **Methodology families.** A methodology string is normalized to a family key
+  (`VERRA-VCS`, `REMOTE-SENSING`, `IOT-SENSORS`, `BLUE-CARBON`, or `UNKNOWN`),
+  and each family carries a relative tolerance (`METHODOLOGY_TOLERANCE`):
+  VERRA-VCS 15%, REMOTE-SENSING 25%, IOT-SENSORS 35%, BLUE-CARBON 30%, default
+  30%.
+- **Algorithm.** For each cluster: with fewer than two sources the assessment is
+  `missing_source` (no cross-check possible). Otherwise each source's deviation
+  from the cluster median is compared against the family tolerance:
+  - all within tolerance → `normal` (info),
+  - exactly one source beyond tolerance → `outlier`,
+  - two or more sources beyond tolerance → `conflicting_sources`.
+  - A source deviating beyond **twice** the tolerance escalates the assessment
+    to `critical` (otherwise `warning`).
+
+Monitors and operators use these assessments to route investigation (e.g. a
+remote-sensing outlier versus a registry estimate), and `critical` findings are
+surfaced by the reliability scheduler.
+
+Surfaces:
+
+- Standalone oracle monitor: `POST /oracle/anomaly` (own service) and reusable
+  `assessCrossSourceAnomaly` / `groupAndAssess` in `oracle/anomaly.ts`.
+- API: `GET /oracle/monitoring/anomalies` → `OracleAnomalyReport` (computed by
+  `OracleMonitoringService.computeCrossSourceAnomalies` over on-chain reports),
+  and the 6-hourly `OracleScheduler` reliability cycle logs any `outlier` /
+  `conflicting_sources` periods for review.
+
+
 ## Security Model
 - Provider whitelist (admin-managed)
 - Provider staking: committed collateral underwrites report quality; `add_stake` / `withdraw_stake` manage exposure
@@ -156,3 +229,9 @@ log-based staleness alerting described in
 - Signature threshold defaults to two independent qualifying sources, with minimum verifier stake required for provider votes
 - Coupon distributions consume only `Verified` reports (enforced by `CouponEngine`); reports in `Challenged` status are rejected, holding coupons in escrow during disputes
 - Multi-sig for high-value reports
+# Report period conflicts
+
+Report periods use half-open intervals (`[period_start, period_end)`). For a
+given project, provider, and methodology, exact or partial overlaps are
+rejected on-chain; adjacent periods are valid. Coupon eligibility also rejects legacy/indexed data
+that contains overlapping periods.
