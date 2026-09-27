@@ -9,11 +9,21 @@ import { HolderIndexService } from '../bonds/holder-index.service';
 import { IntentService } from './services/intent.service';
 import { IntentGuard } from './guards/intent.guard';
 import { IdempotencyService } from './services/idempotency.service';
+import { SearchIndexService } from './search/search-index.service';
+import { EnvConfigValidator } from './config/env-config.validator';
 
 @Global()
 @Module({
   controllers: [RedisHealthController],
-  providers: [NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService, HolderIndexService, IntentService, IntentGuard, IdempotencyService],
-  exports: [NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService, HolderIndexService, IntentService, IntentGuard, IdempotencyService],
+  providers: [
+    NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService,
+    HolderIndexService, IntentService, IntentGuard, IdempotencyService,
+    SearchIndexService, EnvConfigValidator,
+  ],
+  exports: [
+    NonceService, RedisService, SigningKeyProvider, ConfigService, KycStoreService,
+    HolderIndexService, IntentService, IntentGuard, IdempotencyService,
+    SearchIndexService, EnvConfigValidator,
+  ],
 })
 export class CommonModule {}
